@@ -1,0 +1,1537 @@
+# TF-004: Requirements AI Agent
+# Triggered by: discussion created or discussion_comment created
+# Action: Analyze discussion, organize requirements, post structured comment
+name: teraflow-req-agent
+on:
+  discussion:
+    types: [created]
+  discussion_comment:
+    types: [created]
+
+concurrency:
+  group: teraflow-req-agent-${{ github.event.discussion.id }}
+  cancel-in-progress: false
+
+jobs:
+  req-agent:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    permissions:
+      contents: write
+      discussions: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: React with EYES
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "discussion_comment" ]; then
+            SUBJECT_ID="${{ github.event.comment.node_id }}"
+          else
+            SUBJECT_ID="${{ github.event.discussion.node_id }}"
+          fi
+          gh api graphql -f query='
+            mutation($id: ID!) {
+              addReaction(input: {subjectId: $id, content: EYES}) {
+                reaction { content }
+              }
+            }' \
+            -f id="$SUBJECT_ID" 2>/dev/null || true
+
+      - name: Check required secrets
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "has_key=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set. Skipping agent."
+            echo "has_key=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check RBAC permission
+        if: steps.check.outputs.has_key == 'true'
+        id: rbac_check
+        run: |
+          SENDER="${{ github.event.sender.login }}"
+          RESULT=$(teraflow rbac check \
+            --user "$SENDER" \
+            --action "agent.run.requirements" \
+            --config .github/teraflow.yml \
+            --format json 2>/tmp/teraflow_rbac.err || echo '{"allowed":true}')
+          ALLOWED=$(echo "$RESULT" | python3 -c \
+            "import json,sys; print(json.load(sys.stdin).get('allowed', True))" \
+            2>/dev/null || echo "True")
+          echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
+          echo "sender=$SENDER" >> $GITHUB_OUTPUT
+
+      - name: Post API key not set warning
+        if: steps.check.outputs.has_key == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "discussion_comment" ]; then
+            PARENT_ID=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on DiscussionComment { replyTo { id } }
+                }
+              }' \
+              -f id="${{ github.event.comment.node_id }}" 2>/dev/null | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('data',{}).get('node',{}).get('replyTo') or {}).get('id',''))" \
+              2>/dev/null || echo "")
+            if [ -n "$PARENT_ID" ]; then
+              REPLY_ARGS="-f replyToId=$PARENT_ID"
+            else
+              REPLY_ARGS="-f replyToId=${{ github.event.comment.node_id }}"
+            fi
+          else
+            REPLY_ARGS=""
+          fi
+
+          gh api graphql -f query='
+            mutation($id: ID!, $body: String!, $replyToId: ID) {
+              addDiscussionComment(input: {discussionId: $id, body: $body, replyToId: $replyToId}) {
+                comment { id }
+              }
+            }' \
+            -f id="${{ github.event.discussion.node_id }}" \
+            -f body="## ⚠️ AI Agent が応答できませんでした
+
+          API キーが設定されていないため、AI による要件整理を実行できませんでした。
+
+          **対応方法:**
+          1. リポジトリの Settings → Secrets and variables → Actions を開く
+          2. \`.github/teraflow.yml\` の \`assignments\` 設定を確認
+          3. プロバイダーに応じたシークレットを登録:
+             - Anthropic: \`ANTHROPIC_API_KEY\`
+             - OpenAI: \`OPENAI_API_KEY\`
+          4. 設定後、再度 Discussion にコメントすると AI が応答します
+
+          詳細: [AI Provider 設定ガイド](docs/guide/ai-providers.md)" \
+            $REPLY_ARGS
+
+      - name: Post permission denied comment
+        if: steps.rbac_check.outputs.allowed == 'False'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "discussion_comment" ]; then
+            PARENT_ID=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on DiscussionComment { replyTo { id } }
+                }
+              }' \
+              -f id="${{ github.event.comment.node_id }}" 2>/dev/null | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('data',{}).get('node',{}).get('replyTo') or {}).get('id',''))" \
+              2>/dev/null || echo "")
+            if [ -n "$PARENT_ID" ]; then
+              REPLY_ARGS="-f replyToId=$PARENT_ID"
+            else
+              REPLY_ARGS="-f replyToId=${{ github.event.comment.node_id }}"
+            fi
+          else
+            REPLY_ARGS=""
+          fi
+
+          gh api graphql -f query='
+            mutation($id: ID!, $body: String!, $replyToId: ID) {
+              addDiscussionComment(input: {discussionId: $id, body: $body, replyToId: $replyToId}) {
+                comment { id }
+              }
+            }' \
+            -f id="${{ github.event.discussion.node_id }}" \
+            -f body="## 🔒 権限不足
+
+          @${{ steps.rbac_check.outputs.sender }} には \`agent.run.requirements\` 権限がありません。
+          管理者にロールの付与を依頼してください。
+
+          > *teraflow RBAC による自動チェック*" \
+            $REPLY_ARGS
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+        if: steps.check.outputs.has_key == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GONOSUMCHECK: github.com/taka-sho/teraflow
+          GONOSUMDB: github.com/taka-sho/teraflow
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            go build -o ./teraflow .
+            mkdir -p "$(go env GOPATH)/bin"
+            ln -sf "$(pwd)/teraflow" "$(go env GOPATH)/bin/teraflow"
+          else
+            go install "github.com/taka-sho/teraflow@v0.5.20"
+            ln -sf "$(go env GOPATH)/bin/teraflow" ./teraflow
+          fi
+
+      - name: Fetch discussion history
+        if: steps.check.outputs.has_key == 'true'
+        id: history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api graphql -f query='
+            query($owner: String!, $repo: String!, $number: Int!) {
+              repository(owner: $owner, name: $repo) {
+                discussion(number: $number) {
+                  title
+                  body
+                  comments(last: 20) {
+                    nodes {
+                      author { login }
+                      body
+                      createdAt
+                      replies(last: 20) {
+                        nodes {
+                          author { login }
+                          body
+                          createdAt
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' \
+            -f owner="${{ github.repository_owner }}" \
+            -f repo="${{ github.event.repository.name }}" \
+            -F number=${{ github.event.discussion.number }} \
+            > /tmp/discussion_history.json 2>/dev/null || echo '{}' > /tmp/discussion_history.json
+
+          python3 - << 'PYEOF' > /tmp/conversation_history.txt
+          import json
+
+          data = json.load(open('/tmp/discussion_history.json'))
+          discussion = data.get('data', {}).get('repository', {}).get('discussion', {})
+          lines = []
+          lines.append(f"# Discussion: {discussion.get('title', '')}")
+          lines.append(f"\n## 最初の投稿\n{discussion.get('body', '')}\n")
+
+          comments = discussion.get('comments', {}).get('nodes', [])
+          timeline = []
+          for c in comments:
+              timeline.append({
+                  'created_at': c.get('createdAt', ''),
+                  'author': c.get('author', {}).get('login', 'unknown'),
+                  'body': c.get('body', ''),
+              })
+              for r in c.get('replies', {}).get('nodes', []):
+                  timeline.append({
+                      'created_at': r.get('createdAt', ''),
+                      'author': r.get('author', {}).get('login', 'unknown'),
+                      'body': r.get('body', ''),
+                  })
+
+          if timeline:
+              lines.append("## コメント履歴")
+              for entry in sorted(timeline, key=lambda x: x['created_at'] or ''):
+                  lines.append(f"\n**{entry['author']}**: {entry['body']}")
+
+          print('\n'.join(lines))
+          PYEOF
+
+      - name: Generate doc context
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False'
+        run: |
+          set +e
+          DOC_CONTEXT_FILE=/tmp/doc_context.txt
+          : > "$DOC_CONTEXT_FILE"
+
+          INDEX_EXISTS=false
+          teraflow doc index --check-exists >/dev/null 2>&1
+          if [ $? -eq 0 ]; then
+            INDEX_EXISTS=true
+          fi
+
+          if [ "$INDEX_EXISTS" != "true" ]; then
+            for CANDIDATE in \
+              ".teraflow/discovery/doc-index.yaml" \
+              ".teraflow/doc-index.yaml" \
+              "doc-index.yaml"
+            do
+              if [ -f "$CANDIDATE" ]; then
+                INDEX_EXISTS=true
+                break
+              fi
+            done
+          fi
+
+          if [ "$INDEX_EXISTS" != "true" ]; then
+            echo "Doc index not found. Continue with empty doc context."
+            exit 0
+          fi
+
+          python3 - <<'PYEOF' > "$DOC_CONTEXT_FILE" || true
+          import os
+          import re
+          from pathlib import Path
+
+          import yaml
+
+          index_candidates = [
+              Path(".teraflow/discovery/doc-index.yaml"),
+              Path(".teraflow/doc-index.yaml"),
+              Path("doc-index.yaml"),
+          ]
+          index_path = next((p for p in index_candidates if p.exists()), None)
+          if not index_path:
+              raise SystemExit(0)
+
+          history_path = Path("/tmp/conversation_history.txt")
+          discussion = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
+
+          with index_path.open(encoding="utf-8") as f:
+              data = yaml.safe_load(f) or {}
+          docs = data.get("docs") or []
+          if not isinstance(docs, list) or not docs:
+              raise SystemExit(0)
+
+          words = re.findall(r"[A-Za-z0-9_\-\u3040-\u30ff\u4e00-\u9fff]+", discussion.lower())
+          stop = {
+              "the", "and", "for", "with", "from", "this", "that", "what", "when", "where",
+              "have", "has", "you", "your", "about", "into", "while", "will", "shall", "could",
+              "should", "would", "is", "are", "was", "were", "been", "to", "of", "in", "on",
+          }
+          tokens = [w for w in words if len(w) >= 2 and w not in stop]
+
+          def score(doc):
+              fields = []
+              for key in ("title", "summary"):
+                  v = doc.get(key)
+                  if isinstance(v, str):
+                      fields.append(v.lower())
+              for key in ("categories", "keywords"):
+                  arr = doc.get(key)
+                  if isinstance(arr, list):
+                      fields.extend(str(x).lower() for x in arr if isinstance(x, str))
+              text = "\n".join(fields)
+              return sum(1 for t in tokens if t in text)
+
+          ranked = []
+          for doc in docs:
+              if not isinstance(doc, dict):
+                  continue
+              ranked.append((score(doc), doc))
+
+          ranked.sort(key=lambda item: (item[0], -int(item[1].get("total_tokens", 0) or 0)), reverse=True)
+          selected = [doc for sc, doc in ranked if sc > 0][:5]
+          if not selected:
+              selected = [doc for _, doc in ranked[:3]]
+
+          lines = []
+          for doc in selected:
+              path = str(doc.get("path", "")).strip()
+              title = str(doc.get("title", "")).strip()
+              summary = str(doc.get("summary", "")).strip()
+              if not path:
+                  continue
+              header = f"### {path}"
+              if title:
+                  header += f" - {title}"
+              lines.append(header)
+              if summary:
+                  lines.append(summary)
+              lines.append("")
+
+          print("\n".join(lines).strip())
+          PYEOF
+
+      - name: Determine response mode
+        if: steps.check.outputs.has_key == 'true'
+        id: mode
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          DISCUSSION_CATEGORY: ${{ github.event.discussion.category.name }}
+        run: |
+          COMMENT="$COMMENT_BODY"
+          CATEGORY="$DISCUSSION_CATEGORY"
+          LABELS=$(gh api graphql -f query='
+            query($id: ID!) {
+              node(id: $id) {
+                ... on Discussion {
+                  labels(first: 20) { nodes { name } }
+                }
+              }
+            }' \
+            -f id="${{ github.event.discussion.node_id }}" 2>/dev/null | \
+            python3 -c "import json,sys; labels=[n.get('name','') for n in json.load(sys.stdin).get('data',{}).get('node',{}).get('labels',{}).get('nodes',[]) if n.get('name')]; print(','.join(labels))" \
+            2>/dev/null || echo "")
+
+          if echo "$LABELS" | grep -qiE "(^|,)(discovery|要件探索|grill)(,|$)" || [ "$CATEGORY" = "01-Requirements" ]; then
+            if echo "$COMMENT" | grep -q "要求確定"; then
+              echo "mode=discovery-confirm" >> $GITHUB_OUTPUT
+            else
+              echo "mode=discovery" >> $GITHUB_OUTPUT
+            fi
+          elif echo "$COMMENT" | grep -q "要求確定"; then
+            echo "mode=confirm" >> $GITHUB_OUTPUT
+          else
+            echo "mode=dialogue" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check API key
+        if: steps.check.outputs.has_key == 'true' && startsWith(steps.mode.outputs.mode, 'discovery')
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::API キーが設定されていません。ANTHROPIC_API_KEY または OPENAI_API_KEY を GitHub Secrets に設定してください。"
+            exit 1
+          fi
+
+      - name: AI dialogue response
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False' && (steps.mode.outputs.mode == 'dialogue' || steps.mode.outputs.mode == 'confirm')
+        id: req
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODE_OUTPUT: ${{ steps.mode.outputs.mode }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          MODE="$MODE_OUTPUT"
+          COMMENT="$COMMENT_BODY"
+
+          cp /tmp/conversation_history.txt /tmp/req_input.txt
+
+          if [ -n "$COMMENT" ]; then
+            echo "" >> /tmp/req_input.txt
+            echo "最新コメント: $COMMENT" >> /tmp/req_input.txt
+          fi
+
+          if [ "$MODE" = "confirm" ]; then
+            echo "" >> /tmp/req_input.txt
+            echo "（注: ユーザーが「要求確定」を発言しました。最終要件を構造化して出力してください。）" >> /tmp/req_input.txt
+          fi
+
+          teraflow agent assign \
+            --type requirements \
+            --user "${{ steps.rbac_check.outputs.sender }}" \
+            --skill requirements \
+            --input-file /tmp/req_input.txt \
+            --format json \
+            --config .github/teraflow.yml \
+            > /tmp/req_result.json 2>/tmp/teraflow_agent_assign.err || RC=$?
+          if [ "${RC:-0}" != "0" ]; then
+            echo "FAILED_STEP=AI dialogue response" >> $GITHUB_ENV
+            echo "ERROR_TYPE=teraflow" >> $GITHUB_ENV
+            echo "ERROR_FILE=/tmp/teraflow_agent_assign.err" >> $GITHUB_ENV
+            echo '{"output":"要件整理に失敗しました。"}' > /tmp/req_result.json
+          fi
+
+          OUTPUT=$(python3 -c "import json; print(json.load(open('/tmp/req_result.json')).get('output', ''))" 2>/dev/null || echo "要件整理の実行に失敗しました。")
+          DELIM="TERAFLOW_OUTPUT_$(date +%s%N)"
+          echo "output<<${DELIM}" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "${DELIM}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare discovery Python helpers
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False' && startsWith(steps.mode.outputs.mode, 'discovery')
+        run: |
+          cat > /tmp/discovery_parse_helpers.py << 'HELPERS_EOF'
+          def infer_category(question_text):
+              lowered = (question_text or "").strip().lower()
+              if any(key in lowered for key in ("ユーザー", "利用者", "対象")):
+                  return "scope"
+              if any(key in lowered for key in ("期限", "納期", "時期")):
+                  return "timeline"
+              if any(key in lowered for key in ("品質", "成功", "評価", "指標")):
+                  return "quality"
+              if any(key in lowered for key in ("機能", "要件", "実装", "仕様")):
+                  return "functional"
+              return "unknown"
+
+          def extract_questions_from_comment(ai_comment_body):
+              questions = {}
+              current_num = None
+              for line in (ai_comment_body or "").splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      continue
+                  q_match = re.match(r"^(\d+)[\.\)]\s+(.+)$", stripped)
+                  if q_match:
+                      current_num = int(q_match.group(1))
+                      q_text = q_match.group(2).strip()
+                      questions[current_num] = {
+                          "text": q_text,
+                          "choices": {},
+                          "category": infer_category(q_text),
+                      }
+                      continue
+                  if current_num is None or current_num not in questions:
+                      continue
+                  for m in re.finditer(r"([a-zA-Z])[)\.]\s*(.+?)(?=\s+[a-zA-Z][)\.]|$)", stripped):
+                      key = m.group(1).lower()
+                      val = m.group(2).strip(" \t,/")
+                      if val:
+                          questions[current_num]["choices"][key] = val
+              return questions
+
+          def build_unparsed_portion(text, spans):
+              source = (text or "").strip()
+              if not source:
+                  return ""
+              if not spans:
+                  return source
+              merged = []
+              for start, end in sorted(spans, key=lambda s: (s[0], s[1])):
+                  if start >= end:
+                      continue
+                  if merged and start <= merged[-1][1]:
+                      merged[-1][1] = max(merged[-1][1], end)
+                  else:
+                      merged.append([start, end])
+              pieces = []
+              cursor = 0
+              for start, end in merged:
+                  if cursor < start:
+                      pieces.append(source[cursor:start])
+                  cursor = max(cursor, end)
+              if cursor < len(source):
+                  pieces.append(source[cursor:])
+              cleaned = []
+              for piece in pieces:
+                  part = re.sub(r"^[\\s,./:;\\-]+|[\\s,./:;\\-]+$", "", piece)
+                  if part:
+                      cleaned.append(part)
+              return " ".join(cleaned).strip()
+
+          def parse_user_answer(user_text, prev_ai_comment):
+              parsed = {}
+              if not user_text:
+                  return parsed
+              normalized = user_text.strip()
+              import unicodedata
+              normalized = unicodedata.normalize("NFKC", normalized).replace("、", ",")
+              for m in re.finditer(r"(\d+)\s*[\.\-:\)]?\s*([a-z](?:\s*[,/]\s*[a-z])*)", normalized.lower()):
+                  q_num = int(m.group(1))
+                  letters = re.findall(r"[a-z]", m.group(2))
+                  if not letters:
+                      continue
+                  uniq = []
+                  for letter in letters:
+                      if letter not in uniq:
+                          uniq.append(letter)
+                  parsed[q_num] = ",".join(uniq)
+
+              for m in re.finditer(r"(\d+)\s*(?:[\.\-:\)]\s*)?(?:は|:)\s*(.+?)(?=(?:\s+\d+\s*(?:[\.\-:\)]\s*)?(?:[a-z]|は|:))|$)", normalized, flags=re.IGNORECASE):
+                  q_num = int(m.group(1))
+                  if q_num in parsed:
+                      continue
+                  free_text = m.group(2).strip()
+                  if free_text:
+                      parsed[q_num] = free_text
+              return parsed
+
+          def find_recent_assistant_comment(nodes):
+              for node in reversed(nodes or []):
+                  if (node.get("category") or "").strip().lower() != "dialogue":
+                      continue
+                  meta = node.get("meta") or {}
+                  comment_body = (meta.get("assistant_comment") or "").strip()
+                  if comment_body:
+                      return comment_body
+              return ""
+
+          def find_question_node(question_num, q_info, nodes):
+              q_text = (q_info.get("text") or "").strip()
+              non_dialogue = [n for n in walk(nodes) if (n.get("category") or "").strip().lower() != "dialogue"]
+              if q_text:
+                  for node in non_dialogue:
+                      node_q = (node.get("question") or "").strip()
+                      if node_q == q_text:
+                          return node
+                  for node in non_dialogue:
+                      node_q = (node.get("question") or "").strip()
+                      if node_q and (node_q[:30] == q_text[:30] or q_text[:30] == node_q[:30]):
+                          return node
+              ordered_pending = [n for n in non_dialogue if (n.get("status") or "pending").strip().lower() == "pending"]
+              idx = question_num - 1
+              if 0 <= idx < len(ordered_pending):
+                  return ordered_pending[idx]
+              return None
+
+          def stage1_parse_user_answers(user_text, nodes):
+              prev_comment = find_recent_assistant_comment(nodes)
+              questions = extract_questions_from_comment(prev_comment)
+              parsed_answers = parse_user_answer(user_text, prev_comment)
+              parse_result = []
+              for q_num, answer_code in sorted(parsed_answers.items()):
+                  q_info = questions.get(q_num) or {"text": "", "choices": {}, "category": "unknown"}
+                  node = find_question_node(q_num, q_info, nodes)
+                  if node is None:
+                      continue
+                  final_answer = answer_code
+                  choices = q_info.get("choices") or {}
+                  if re.fullmatch(r"[a-z](?:,[a-z])*$", answer_code):
+                      labels = [c.strip() for c in answer_code.split(",") if c.strip()]
+                      choice_texts = [choices[c] for c in labels if c in choices]
+                      if choice_texts:
+                          final_answer = " / ".join(choice_texts)
+                  parse_result.append({
+                      "question_num": q_num,
+                      "branch_id": node.get("id") or "",
+                      "choice": answer_code,
+                      "answer": final_answer.strip(),
+                      "category": q_info.get("category") or "",
+                  })
+              return parse_result, questions
+
+          def mark_resolved_from_parse(parse_result, nodes):
+              applied = []
+              now = datetime.now(timezone.utc).isoformat()
+              for row in parse_result or []:
+                  node_id = (row.get("branch_id") or "").strip()
+                  if not node_id:
+                      continue
+                  node = find_node(nodes, node_id)
+                  if node is None:
+                      continue
+                  answer = (row.get("answer") or "").strip()
+                  if not answer:
+                      continue
+                  node["status"] = "answered"
+                  node["answer"] = answer
+                  node["resolved_by"] = "user"
+                  node["resolved_at"] = now
+                  if "skip_reason" in node:
+                      node.pop("skip_reason")
+                  applied.append({
+                      "question_num": row.get("question_num"),
+                      "branch_id": node_id,
+                      "choice": row.get("choice") or "",
+                      "answer": answer,
+                      "category": row.get("category") or "",
+                  })
+              return applied
+
+          def simplify_question_label(text):
+              label = (text or "").strip()
+              label = re.sub(r"[？?]+$", "", label)
+              for suffix in ("はどれですか", "を教えてください", "は何ですか", "でしょうか", "ですか"):
+                  if label.endswith(suffix):
+                      label = label[: -len(suffix)].strip()
+                      break
+              return label or "確認項目"
+
+          def update_confirmed_from_parse(parse_result, questions, summary):
+              confirmed = normalize_list(summary.get("confirmed"))
+              for row in parse_result or []:
+                  q_num = row.get("question_num")
+                  q_info = questions.get(q_num) if isinstance(questions, dict) else None
+                  q_text = (q_info or {}).get("text") or ""
+                  choice_map = (q_info or {}).get("choices") or {}
+                  answer_code = (row.get("choice") or "").strip().lower()
+                  human_answer = ""
+                  if re.fullmatch(r"[a-z](?:,[a-z])*$", answer_code):
+                      keys = [c.strip() for c in answer_code.split(",") if c.strip()]
+                      values = [choice_map.get(k, "") for k in keys]
+                      values = [v for v in values if v]
+                      if values:
+                          human_answer = ", ".join(values)
+                  if not human_answer:
+                      human_answer = (row.get("answer") or "").replace(" / ", ", ").strip()
+                  if not human_answer:
+                      continue
+                  label = simplify_question_label(q_text) if q_text else "確認項目"
+                  confirmed.append(f"{label}: {human_answer}")
+              summary["confirmed"] = list(dict.fromkeys(confirmed))
+              return summary["confirmed"]
+
+          def merge_ai_resolved(ai_resolved_branches, parse_confirmed, summary):
+              merged = normalize_list(parse_confirmed) if parse_confirmed else normalize_list(summary.get("confirmed"))
+              for row in ai_resolved_branches or []:
+                  answer = (row.get("answer") or "").strip()
+                  if not answer:
+                      continue
+                  question = (row.get("question") or "").strip()
+                  branch_id = (row.get("id") or "").strip()
+                  label = simplify_question_label(question) if question else (branch_id or "確認項目")
+                  merged.append(f"{label}: {answer}")
+              summary["confirmed"] = list(dict.fromkeys(merged))
+              return summary["confirmed"]
+
+          HELPERS_EOF
+
+      - name: Discovery input preparation
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False' && startsWith(steps.mode.outputs.mode, 'discovery')
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODE_OUTPUT: ${{ steps.mode.outputs.mode }}
+          DISC_NUM: ${{ github.event.discussion.number }}
+          DISC_TITLE: ${{ github.event.discussion.title }}
+          DISC_BODY: ${{ github.event.discussion.body }}
+          LATEST_COMMENT: ${{ github.event.comment.body }}
+        run: |
+          set -e
+          STATE_FILE=".teraflow/discovery/discussion-${DISC_NUM}.yaml"
+          DRAFT_FILE=".teraflow/discovery/discussion-${DISC_NUM}-draft.md"
+          SUMMARY_FILE=".teraflow/discovery/discussion-${DISC_NUM}-summary.yaml"
+          mkdir -p .teraflow/discovery
+
+          if [ -f "$STATE_FILE" ]; then
+            SKILL_MODE="dialogue"
+          else
+            SKILL_MODE="init"
+          fi
+          if [ "$MODE_OUTPUT" = "discovery-confirm" ]; then
+            SKILL_MODE="confirm"
+          fi
+          export SKILL_MODE
+
+          python3 - <<'PYEOF' > /tmp/discovery_input.txt
+          import os
+          import yaml
+
+          disc_num = os.environ.get("DISC_NUM", "")
+          summary_path = f".teraflow/discovery/discussion-{disc_num}-summary.yaml"
+          discussion_body = (os.environ.get("DISC_BODY") or "").strip()
+          latest_comment = (os.environ.get("LATEST_COMMENT") or "").strip()
+          skill_mode = (os.environ.get("SKILL_MODE") or "").strip()
+          doc_context_path = "/tmp/doc_context.txt"
+
+          def normalize_list(value):
+              if isinstance(value, list):
+                  out = []
+                  for item in value:
+                      text = str(item).strip()
+                      if text:
+                          out.append(text)
+                  return out
+              if isinstance(value, str):
+                  text = value.strip()
+                  return [text] if text else []
+              return []
+
+          summary = {
+              "confirmed": [],
+              "unresolved": [],
+              "context": [],
+              "next_focus": [],
+              "round_count": 0,
+          }
+          if os.path.exists(summary_path):
+              with open(summary_path, encoding="utf-8") as f:
+                  loaded = yaml.safe_load(f) or {}
+              if isinstance(loaded, dict):
+                  summary["confirmed"] = normalize_list(loaded.get("confirmed"))
+                  summary["unresolved"] = normalize_list(loaded.get("unresolved"))
+                  summary["context"] = normalize_list(loaded.get("context"))
+                  summary["next_focus"] = normalize_list(loaded.get("next_focus"))
+                  try:
+                      summary["round_count"] = int(loaded.get("round_count", 0))
+                  except Exception:
+                      summary["round_count"] = 0
+
+          doc_context = ""
+          if os.path.exists(doc_context_path):
+              with open(doc_context_path, encoding="utf-8") as f:
+                  doc_context = f.read().strip()
+
+          parts = []
+          parts.append("## Discussion 本文（初回投稿）")
+          parts.append(discussion_body)
+          parts.append("")
+          parts.append("## 構造化サマリ")
+          parts.append(yaml.safe_dump(summary, allow_unicode=True, sort_keys=False).rstrip())
+          parts.append("")
+          parts.append("## 既存ドキュメント参照")
+          parts.append(doc_context)
+          parts.append("")
+          parts.append("## 最新コメント")
+          parts.append(latest_comment)
+          parts.append("")
+          parts.append("## モード")
+          parts.append(skill_mode)
+          print("\n".join(parts))
+          PYEOF
+
+          RC=0
+          teraflow agent assign \
+            --type requirements \
+            --user "${{ steps.rbac_check.outputs.sender }}" \
+            --skill discovery \
+            --input-file /tmp/discovery_input.txt \
+            --format json \
+            --config .github/teraflow.yml \
+            > /tmp/discovery_result.json 2>/tmp/discovery_agent.err || RC=$?
+          # フォールバックスクリプト準備（if外: YAML剥ぎ取り後column 0に維持）
+          cat > /tmp/discovery_fallback.py << 'PYEOF'
+          import json
+
+          fallback_data = {
+              "action": "ask",
+              "resolved_branches": [],
+              "new_branches": [
+                  {
+                      "id": "scope.target_users",
+                      "question": "対象ユーザーはどれですか？",
+                      "category": "scope",
+                      "recommendation": "社内利用者",
+                  },
+                  {
+                      "id": "scope.platform",
+                      "question": "対応プラットフォームはどれですか？",
+                      "category": "scope",
+                      "recommendation": "Webのみ",
+                  },
+                  {
+                      "id": "scope.priority",
+                      "question": "最優先で実装する範囲はどれですか？",
+                      "category": "priority",
+                      "recommendation": "MVP最小構成",
+                  },
+              ],
+              "auto_resolved": [],
+              "next_question": {
+                  "id": "scope.target_users",
+                  "question": "対象ユーザーはどれですか？",
+                  "recommendation": "社内利用者",
+              },
+              "draft_update": "",
+              "discussion_comment": "## 🔍 要件探索\n\n以下について教えてください：\n\n1. 対象ユーザーはどれですか？\n   a) 社内利用者  b) 一般ユーザー  c) 管理者  d) その他\n\n2. 対応プラットフォームはどれですか？\n   a) Webのみ  b) Web+API  c) モバイル含む  d) 未定\n\n3. 最優先で実装する範囲はどれですか？\n   a) MVP最小構成  b) 標準機能一式  c) 拡張含む  d) 未定\n\n> 記号で回答できます: 「1a 2b 3c」",
+          }
+          result = {"output": json.dumps(fallback_data, ensure_ascii=False)}
+          with open("/tmp/discovery_result.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False)
+          PYEOF
+
+          if [ "${RC:-0}" != "0" ]; then
+            echo "FAILED_STEP=Discovery grill-me response" >> $GITHUB_ENV
+            echo "ERROR_TYPE=teraflow" >> $GITHUB_ENV
+            echo "ERROR_FILE=/tmp/discovery_agent.err" >> $GITHUB_ENV
+            python3 /tmp/discovery_fallback.py 2>/dev/null || \
+              echo '{"output":"要件探索の実行に失敗しました。"}' > /tmp/discovery_result.json
+          fi
+
+          echo "SKILL_MODE=$SKILL_MODE" >> $GITHUB_ENV
+
+      - name: Discovery grill-me response
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False' && startsWith(steps.mode.outputs.mode, 'discovery')
+        id: discovery
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODE_OUTPUT: ${{ steps.mode.outputs.mode }}
+          DISC_NUM: ${{ github.event.discussion.number }}
+          DISC_TITLE: ${{ github.event.discussion.title }}
+          DISC_BODY: ${{ github.event.discussion.body }}
+          LATEST_COMMENT: ${{ github.event.comment.body }}
+        run: |
+          set -e
+          python3 - <<'PYEOF'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+          import yaml
+
+          disc_num = os.environ.get("DISC_NUM", "")
+          state_path = f".teraflow/discovery/discussion-{disc_num}.yaml"
+          draft_path = f".teraflow/discovery/discussion-{disc_num}-draft.md"
+          summary_path = f".teraflow/discovery/discussion-{disc_num}-summary.yaml"
+          skill_mode = (os.environ.get("SKILL_MODE") or "").strip().lower()
+          disc_title = (os.environ.get("DISC_TITLE") or "").strip()
+          disc_body = (os.environ.get("DISC_BODY") or "").strip()
+          latest_comment = (os.environ.get("LATEST_COMMENT") or "").strip()
+
+          with open("/tmp/discovery_result.json", encoding="utf-8") as f:
+              result = json.load(f)
+          raw_output = result.get("output", "")
+
+          def parse_payload(raw):
+              if isinstance(raw, dict):
+                  return raw
+              if not isinstance(raw, str):
+                  return {}
+
+              text = raw.strip()
+              if not text:
+                  return {}
+
+              candidates = [text]
+
+              for m in re.finditer(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text):
+                  candidates.append(m.group(1).strip())
+
+              brace_start = text.find("{")
+              brace_end = text.rfind("}")
+              if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
+                  candidates.append(text[brace_start:brace_end + 1].strip())
+
+              seen = set()
+              for cand in candidates:
+                  if cand in seen:
+                      continue
+                  seen.add(cand)
+                  try:
+                      parsed = json.loads(cand)
+                  except Exception:
+                      continue
+                  if isinstance(parsed, dict):
+                      if isinstance(parsed.get("output"), dict):
+                          return parsed["output"]
+                      return parsed
+
+              return {"discussion_comment": text}
+
+          data = parse_payload(raw_output)
+
+          if os.path.exists(state_path):
+              with open(state_path, encoding="utf-8") as f:
+                  state = yaml.safe_load(f) or {}
+          else:
+              state = {
+                  "version": "1",
+                  "discussion_number": int(disc_num),
+                  "title": "",
+                  "created_at": datetime.now(timezone.utc).isoformat(),
+                  "mode": "sequential",
+                  "tree": [],
+                  "summary": {"total": 0, "answered": 0, "pending": 0, "skipped": 0, "blocked": 0, "progress_percent": 0},
+              }
+
+          if disc_title:
+              state["title"] = disc_title
+
+          def walk(nodes):
+              for n in nodes or []:
+                  yield n
+                  for c in walk(n.get("children", [])):
+                      yield c
+
+          def find_node(nodes, node_id):
+              for node in nodes or []:
+                  if node.get("id") == node_id:
+                      return node
+                  found = find_node(node.get("children", []), node_id)
+                  if found:
+                      return found
+              return None
+
+          def attach_node(nodes, parent_id, new_node):
+              if not parent_id:
+                  nodes.append(new_node)
+                  return True
+              parent = find_node(nodes, parent_id)
+              if parent is None:
+                  nodes.append(new_node)
+                  return False
+              parent.setdefault("children", []).append(new_node)
+              return True
+
+          tree = state.setdefault("tree", [])
+
+          def pick_digest(text, default):
+              for ln in (text or "").splitlines():
+                  line = ln.strip()
+                  if not line:
+                      continue
+                  if line.startswith(("#", ">", "```")):
+                      continue
+                  return line[:120]
+              return default
+
+          for row in data.get("new_branches", []) or []:
+              node_id = (row.get("id") or "").strip()
+              if not node_id or find_node(tree, node_id):
+                  continue
+              node = {
+                  "id": node_id,
+                  "question": (row.get("question") or "").strip(),
+                  "category": (row.get("category") or "").strip(),
+                  "status": "pending",
+                  "recommendation": (row.get("recommendation") or "").strip(),
+                  "answer": "",
+                  "depends_on": row.get("depends_on") or [],
+                  "children": [],
+              }
+              attach_node(tree, row.get("parent_id"), node)
+
+          exec(open('/tmp/discovery_parse_helpers.py').read())
+          parsed_answers = []
+          stage1_parse_result = []
+          stage1_questions = {}
+          stage1_unparsed_portion = ""
+          if latest_comment and skill_mode != "init":
+              stage1_parse_result, stage1_questions = stage1_parse_user_answers(latest_comment, tree)
+              parsed_answers = mark_resolved_from_parse(stage1_parse_result, tree)
+
+          def mark_resolved(rows, resolved_by_default):
+              for row in rows or []:
+                  node_id = (row.get("id") or "").strip()
+                  if not node_id:
+                      continue
+                  node = find_node(tree, node_id)
+                  if node is None:
+                      node = {
+                          "id": node_id,
+                          "question": "",
+                          "category": "",
+                          "status": "answered",
+                          "children": [],
+                      }
+                      tree.append(node)
+                  node["status"] = "answered"
+                  node["answer"] = (row.get("answer") or "").strip()
+                  node["resolved_by"] = (row.get("resolved_by") or resolved_by_default).strip()
+                  node["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                  if "skip_reason" in node:
+                      node.pop("skip_reason")
+
+          mark_resolved(data.get("resolved_branches", []), "user")
+          mark_resolved(data.get("auto_resolved", []), "auto")
+
+          _raw_comment = data.get("discussion_comment") or ""
+          if isinstance(_raw_comment, list):
+              _raw_comment = "\n".join(str(item) for item in _raw_comment)
+          comment = str(_raw_comment).strip()
+          # Normalize literal \n from LLM JSON double-escaping so that
+          # count_numbered_questions() and is_footer_only() work correctly.
+          comment = comment.replace("\\n", "\n")
+          if not comment and data.get("next_question"):
+              nq = data["next_question"]
+              q = (nq.get("question") or "").strip()
+              rec = (nq.get("recommendation") or "").strip()
+              if q:
+                  comment = "## 🔍 要件探索\n\n"
+                  comment += "以下について教えてください：\n\n"
+                  comment += f"1. {q}\n"
+                  if rec:
+                      comment += f"   a) {rec}  b) その他（内容を記述）\n"
+                  comment += "\n> *記号で回答できます: 「1a」。推奨回答でよければ「OK」。*\n"
+                  comment += "> *「スキップ」で後回し、「要求確定」で最終要件を出力します。*"
+
+          if comment or disc_body or latest_comment:
+              turn_id = f"dialogue.{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+              user_input = disc_body if skill_mode == "init" else latest_comment
+              status = "answered" if user_input else "pending"
+              tree.append({
+                  "id": turn_id,
+                  "question": pick_digest(comment, "要件探索の問いかけ"),
+                  "category": "dialogue",
+                  "status": status,
+                  "recommendation": "",
+                  "answer": user_input,
+                  "resolved_by": "user" if user_input else "agent",
+                  "resolved_at": datetime.now(timezone.utc).isoformat(),
+                  "depends_on": [],
+                  "children": [],
+                  "meta": {
+                      "skill_mode": skill_mode,
+                      "discussion_title": disc_title,
+                      "assistant_comment": comment,
+                      "latest_user_comment": latest_comment,
+                      "parsed_answers": parsed_answers,
+                      "unparsed_portion": stage1_unparsed_portion,
+                  },
+              })
+
+          def build_summary(text):
+              cleaned = []
+              for ln in (text or "").splitlines():
+                  row = ln.strip()
+                  if not row:
+                      continue
+                  if row.startswith(("#", "```")):
+                      continue
+                  row = row.lstrip("-*0123456789. ").strip()
+                  if row:
+                      cleaned.append(row)
+                  if len(cleaned) >= 3:
+                      break
+              if not cleaned:
+                  return "Discussion本文の記述が少ないため、目的・対象範囲・優先度の確認から開始します。"
+              summary = " / ".join(cleaned)
+              return summary[:300]
+
+          if not comment and skill_mode == "init":
+              nq = data.get("next_question") or {}
+              q = (nq.get("question") or "").strip()
+              rec = (nq.get("recommendation") or "").strip()
+              if not q:
+                  q = "今回の成果物の最終ゴール（完成条件）を1文で定義しますか？"
+              if not rec:
+                  rec = "まずMVPを定義し、完成条件・対象ユーザー・納期を明確化する。"
+              summary = build_summary(disc_body)
+              if disc_title:
+                  summary = f"{disc_title}: {summary}"
+              comment = "## 🔍 要件探索\n\n"
+              comment += "### 要件の要約\n"
+              comment += f"{summary}\n\n"
+              comment += "### 最初の質問\n\n"
+              comment += f"1. {q}\n"
+              comment += f"   a) {rec}  b) その他（内容を記述）\n\n"
+              comment += "> *記号で回答できます: 「1a」。推奨回答でよければ「OK」。*\n"
+              comment += "> *「スキップ」で後回し、「要求確定」で最終要件を出力します。*"
+
+          def count_numbered_questions(text):
+              count = 0
+              for ln in (text or "").splitlines():
+                  line = ln.strip()
+                  if re.match(r"^\d+[\.\)]\s+\S+", line):
+                      count += 1
+              return count
+
+          def is_footer_only(text):
+              lines = []
+              for ln in (text or "").splitlines():
+                  row = ln.strip()
+                  if row:
+                      lines.append(row)
+              if not lines:
+                  return True
+              if count_numbered_questions(text) > 0:
+                  return False
+              non_footer = []
+              footer_markers = (
+                  "teraflow discovery agent",
+                  "記号で回答できます",
+                  "要件探索です",
+                  "要件確定です",
+              )
+              for row in lines:
+                  lowered = row.lower()
+                  if row.startswith(">"):
+                      continue
+                  if any(marker in lowered for marker in footer_markers):
+                      continue
+                  if row in ("---", "___"):
+                      continue
+                  non_footer.append(row)
+              return len(non_footer) == 0
+
+          def build_fallback_comment():
+              summary = build_summary(disc_body if skill_mode == "init" else latest_comment)
+              if disc_title:
+                  summary = f"{disc_title}: {summary}"
+              q1 = "対象ユーザーはどれですか？"
+              q2 = "最優先で実装する範囲はどれですか？"
+              q3 = "成功条件はどれで評価しますか？"
+              return (
+                  "## 🔍 要件探索\n\n"
+                  "以下について教えてください：\n\n"
+                  f"1. {q1}\n"
+                  "   a) 社内利用者  b) 一般ユーザー  c) 管理者  d) その他\n\n"
+                  f"2. {q2}\n"
+                  "   a) MVP最小構成  b) 標準機能一式  c) 拡張含む  d) 未定\n\n"
+                  f"3. {q3}\n"
+                  "   a) 納期順守  b) 品質重視  c) 利用率重視  d) バランス\n\n"
+                  f"> 要約: {summary}\n"
+                  "> 記号で回答できます: 「1a 2b 3c」。\n"
+                  "> 「スキップ」で後回し、「要求確定」で最終要件を出力します。"
+              )
+
+          requires_question_list = skill_mode != "confirm"
+          if requires_question_list:
+              question_count = count_numbered_questions(comment)
+              is_error_message = any(kw in comment for kw in ["失敗しました", "エラー", "error", "failed"])
+              if question_count < 3 or is_footer_only(comment) or is_error_message:
+                  comment = build_fallback_comment()
+
+          def recompute_summary(nodes):
+              summary = {"total": 0, "answered": 0, "pending": 0, "skipped": 0, "blocked": 0}
+              for n in walk(nodes):
+                  if (n.get("category") or "").strip().lower() == "dialogue":
+                      continue
+                  status = (n.get("status") or "pending").strip().lower()
+                  if status == "resolved":
+                      status = "answered"
+                  if status not in ("answered", "pending", "skipped", "blocked"):
+                      status = "pending"
+                  n["status"] = status
+                  summary["total"] += 1
+                  summary[status] += 1
+              total = summary["total"]
+              done = summary["answered"] + summary["skipped"]
+              summary["progress_percent"] = int((done / total) * 100) if total > 0 else 0
+              return summary
+
+          state["updated_at"] = datetime.now(timezone.utc).isoformat()
+          state["summary"] = recompute_summary(tree)
+
+          with open(state_path, "w", encoding="utf-8") as f:
+              yaml.safe_dump(state, f, allow_unicode=True, sort_keys=False)
+
+          draft_update = data.get("draft_update")
+          if isinstance(draft_update, str) and draft_update.strip():
+              with open(draft_path, "w", encoding="utf-8") as f:
+                  f.write(draft_update.rstrip() + "\n")
+          elif not os.path.exists(draft_path):
+              s = state["summary"]
+              with open(draft_path, "w", encoding="utf-8") as f:
+                  f.write(f"# discovery draft #{disc_num}\n\n")
+                  f.write(f"- progress: {s.get('answered',0)}/{s.get('total',0)} ({s.get('progress_percent',0)}%)\n")
+
+          def normalize_list(value):
+              if isinstance(value, list):
+                  out = []
+                  for item in value:
+                      text = str(item).strip()
+                      if text:
+                          out.append(text)
+                  return out
+              if isinstance(value, str):
+                  text = value.strip()
+                  return [text] if text else []
+              return []
+
+          existing_summary = {}
+          if os.path.exists(summary_path):
+              with open(summary_path, encoding="utf-8") as f:
+                  existing_summary = yaml.safe_load(f) or {}
+          if not isinstance(existing_summary, dict):
+              existing_summary = {}
+
+          confirmed = []
+          unresolved = []
+          for node in walk(tree):
+              if (node.get("category") or "").strip().lower() == "dialogue":
+                  continue
+              question = (node.get("question") or "").strip()
+              answer = (node.get("answer") or "").strip()
+              status = (node.get("status") or "").strip().lower()
+              if status == "resolved":
+                  status = "answered"
+              if status == "answered" and answer:
+                  if question:
+                      confirmed.append(f"{question}: {answer}")
+                  else:
+                      confirmed.append(answer)
+                  continue
+              if status in ("pending", "blocked", "skipped"):
+                  if question:
+                      unresolved.append(question)
+                  elif node.get("id"):
+                      unresolved.append(str(node.get("id")))
+
+          summary_cache = {"confirmed": normalize_list(existing_summary.get("confirmed"))}
+          parse_confirmed = update_confirmed_from_parse(stage1_parse_result, stage1_questions, summary_cache)
+          merged_confirmed = merge_ai_resolved(data.get("resolved_branches", []), parse_confirmed, summary_cache)
+          confirmed = list(dict.fromkeys(merged_confirmed + confirmed))
+
+          context = normalize_list(existing_summary.get("context"))
+          if disc_title:
+              title_line = f"Discussion: {disc_title}"
+              if title_line not in context:
+                  context.append(title_line)
+          if disc_body:
+              digest = ""
+              for ln in disc_body.splitlines():
+                  row = ln.strip()
+                  if not row:
+                      continue
+                  if row.startswith(("#", ">", "```")):
+                      continue
+                  digest = row
+                  break
+              if digest:
+                  body_line = f"初回投稿要約: {digest[:140]}"
+                  if body_line not in context:
+                      context.append(body_line)
+
+          next_focus = []
+          if isinstance(data.get("next_question"), dict):
+              nq_q = (data["next_question"].get("question") or "").strip()
+              nq_rec = (data["next_question"].get("recommendation") or "").strip()
+              if nq_q:
+                  focus = nq_q
+                  if nq_rec:
+                      focus = f"{nq_q} (推奨: {nq_rec})"
+                  next_focus.append(focus)
+          if not next_focus and unresolved:
+              next_focus.append(unresolved[0])
+
+          prev_round = existing_summary.get("round_count", 0)
+          try:
+              prev_round = int(prev_round)
+          except Exception:
+              prev_round = 0
+          round_count = prev_round + 1
+
+          structured_summary = {
+              "confirmed": list(dict.fromkeys(confirmed)),
+              "unresolved": list(dict.fromkeys(unresolved)),
+              "context": context,
+              "next_focus": next_focus,
+              "round_count": round_count,
+          }
+
+          with open(summary_path, "w", encoding="utf-8") as f:
+              yaml.safe_dump(structured_summary, f, allow_unicode=True, sort_keys=False)
+
+          with open("/tmp/discovery_comment.txt", "w", encoding="utf-8") as f:
+              f.write(comment if comment else "## 🔍 要件探索\n\n次の質問に進みます。")
+          PYEOF
+
+          git config user.name "teraflow[bot]"
+          git config user.email "teraflow[bot]@users.noreply.github.com"
+          git add .teraflow/discovery/
+          git diff --cached --quiet || git commit -m "chore: update discovery state [skip ci]"
+          git push origin HEAD || true
+
+          if [ ! -f /tmp/discovery_comment.txt ]; then
+            echo "Discovery agent を起動しています。しばらくお待ちください。" > /tmp/discovery_comment.txt
+          fi
+
+          DELIM="TERAFLOW_OUTPUT_$(date +%s%N)"
+          echo "output<<${DELIM}" >> "$GITHUB_OUTPUT"
+          cat /tmp/discovery_comment.txt >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "${DELIM}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git identity
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False' && (steps.mode.outputs.mode == 'confirm' || startsWith(steps.mode.outputs.mode, 'discovery'))
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Guard doc generate when confirmed is empty
+        if: (steps.mode.outputs.mode == 'confirm' || steps.mode.outputs.mode == 'discovery-confirm') && steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False'
+        id: guard_docgen
+        env:
+          DISC_NUM: ${{ github.event.discussion.number }}
+        run: |
+          CONFIRMED_COUNT=$(python3 -c "import yaml, os; path=f\".teraflow/discovery/discussion-{os.environ.get('DISC_NUM','')}-summary.yaml\"; d=(yaml.safe_load(open(path)) if os.path.exists(path) else {}) or {}; print(len(d.get('confirmed', [])))" 2>/dev/null || echo "0")
+
+          echo "confirmed_count=$CONFIRMED_COUNT" >> $GITHUB_OUTPUT
+          if [ "$CONFIRMED_COUNT" = "0" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "SKIP_DOC_GENERATE=true" >> $GITHUB_ENV
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate CoDD document and create PR
+        if: (steps.mode.outputs.mode == 'confirm' || steps.mode.outputs.mode == 'discovery-confirm') && steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False' && steps.guard_docgen.outputs.skip != 'true'
+        id: docgen
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -o pipefail
+          teraflow doc generate \
+            --discussion ${{ github.event.discussion.number }} \
+            --config .github/teraflow.yml \
+            --create-pr \
+            --format json \
+            2>/tmp/teraflow_docgen.err | tee /tmp/docgen.json || RC=$?
+          if [ "${RC:-0}" != "0" ]; then
+            echo "FAILED_STEP=Generate CoDD document" >> $GITHUB_ENV
+            echo "ERROR_TYPE=teraflow" >> $GITHUB_ENV
+            echo "ERROR_FILE=/tmp/teraflow_docgen.err" >> $GITHUB_ENV
+            exit $RC
+          fi
+
+          PR_URL=$(python3 -c "import json; print(json.load(open('/tmp/docgen.json')).get('pr_url',''))")
+          if [ -z "$PR_URL" ]; then
+            echo "::error::doc generate did not return pr_url"
+            exit 1
+          fi
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+      - name: Post confirmed-empty warning
+        if: steps.check.outputs.has_key == 'true' && steps.mode.outputs.skip == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api graphql -f query='
+            mutation($id: ID!, $body: String!) {
+              addDiscussionComment(input: {discussionId: $id, body: $body}) {
+                comment { id }
+              }
+            }' \
+            -f id="${{ github.event.discussion.node_id }}" \
+            -f body="## ⚠️ 要件確定を保留しました
+
+          confirmed が 0 件のため、CoDD 文書生成をスキップしました。
+          まず質問への回答を追加し、confirmed を蓄積してから再度「要求確定」を実行してください。
+
+          > *teraflow discovery agent guard*"
+
+      - name: Post response
+        if: steps.check.outputs.has_key == 'true' && (steps.guard_docgen.outputs.skip != 'true' || (steps.mode.outputs.mode != 'confirm' && steps.mode.outputs.mode != 'discovery-confirm'))
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MODE="${{ steps.mode.outputs.mode }}"
+          if [ "$MODE" = "discovery-confirm" ]; then
+            HEADER="## 📋 要件確定"
+            PR_URL="${{ steps.docgen.outputs.pr_url }}"
+            if [ -n "$PR_URL" ]; then
+              FOOTER=$(printf '📄 CoDD要件定義書のPRを作成しました: %s\n\n> *teraflow discovery agent による要件確定です。内容を確認の上、修正してください。*' "$PR_URL")
+            else
+              FOOTER="> *teraflow discovery agent による要件確定です。*"
+            fi
+            BODY="${{ steps.discovery.outputs.output }}"
+          elif [ "$MODE" = "discovery" ]; then
+            HEADER="## 🔍 要件探索"
+            FOOTER="> *teraflow discovery agent による要件探索です。*"
+            BODY="${{ steps.discovery.outputs.output }}"
+          elif [ "$MODE" = "confirm" ]; then
+            HEADER="## 📋 要件確定"
+            PR_URL="${{ steps.docgen.outputs.pr_url }}"
+            if [ -n "$PR_URL" ]; then
+              FOOTER=$(printf '📄 CoDD要件定義書のPRを作成しました: %s\n\n> *teraflow req-agent による要件確定です。内容を確認の上、修正してください。*' "$PR_URL")
+            else
+              FOOTER="> *teraflow req-agent による要件確定です。内容を確認の上、修正してください。*"
+            fi
+            BODY="${{ steps.req.outputs.output }}"
+          else
+            HEADER="## 💬 AI壁打ち"
+            FOOTER="> *teraflow req-agent との壁打ちです。「要求確定」と発言すると最終要件を出力します。*"
+            BODY="${{ steps.req.outputs.output }}"
+          fi
+
+          # Confirm modes post as top-level comments (visible to all participants)
+          if [ "$MODE" = "confirm" ] || [ "$MODE" = "discovery-confirm" ]; then
+            REPLY_ARGS=""
+          elif [ "${{ github.event_name }}" = "discussion_comment" ]; then
+            PARENT_ID=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on DiscussionComment { replyTo { id } }
+                }
+              }' \
+              -f id="${{ github.event.comment.node_id }}" 2>/dev/null | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('data',{}).get('node',{}).get('replyTo') or {}).get('id',''))" \
+              2>/dev/null || echo "")
+            if [ -n "$PARENT_ID" ]; then
+              REPLY_ARGS="-f replyToId=$PARENT_ID"
+            else
+              REPLY_ARGS="-f replyToId=${{ github.event.comment.node_id }}"
+            fi
+          else
+            REPLY_ARGS=""
+          fi
+
+          gh api graphql -f query='
+            mutation($id: ID!, $body: String!, $replyToId: ID) {
+              addDiscussionComment(input: {discussionId: $id, body: $body, replyToId: $replyToId}) {
+                comment { id }
+              }
+            }' \
+            -f id="${{ github.event.discussion.node_id }}" \
+            -f body="$HEADER
+
+          $BODY
+
+          $FOOTER" \
+            $REPLY_ARGS
+
+      - name: Post failure comment with details
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. エラー内容を組み立て
+          FAILED_STEP="${FAILED_STEP:-unknown}"
+          ERROR_TYPE="${ERROR_TYPE:-actions}"
+          ERROR_CONTENT=""
+
+          if [ -n "${ERROR_FILE:-}" ] && [ -f "$ERROR_FILE" ]; then
+            ERROR_CONTENT=$(cat "$ERROR_FILE")
+          fi
+
+          if [ -z "$ERROR_CONTENT" ]; then
+            ERROR_CONTENT="（詳細は実行ログを確認してください）"
+          fi
+
+          # 2. teraflow JSON エラーなら parse
+          ERROR_CODE=""
+          ERROR_MSG="$ERROR_CONTENT"
+          ERROR_DETAILS=""
+          if [ "$ERROR_TYPE" = "teraflow" ]; then
+            PARSED=$(echo "$ERROR_CONTENT" | python3 -c '
+          import json, sys
+          try:
+              d = json.loads(sys.stdin.read())
+              print(d.get("error_code",""))
+              print(d.get("message",""))
+              print(d.get("details","") or "")
+          except Exception:
+              print(""); print(""); print("")
+          ' 2>/dev/null || printf '\n\n\n')
+            ERROR_CODE=$(echo "$PARSED" | sed -n '1p')
+            ERROR_MSG=$(echo "$PARSED" | sed -n '2p')
+            ERROR_DETAILS=$(echo "$PARSED" | sed -n '3p')
+            if [ -z "$ERROR_MSG" ]; then
+              ERROR_MSG="$ERROR_CONTENT"
+            fi
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # 3. コメント本文を組み立て
+          BODY="## ❌ エラーが発生しました
+
+          **失敗したステップ**: \`$FAILED_STEP\`
+          **エラー種別**: $ERROR_TYPE"
+
+          if [ -n "$ERROR_CODE" ]; then
+            BODY="$BODY
+          **エラーコード**: \`$ERROR_CODE\`"
+          fi
+
+          BODY="$BODY
+
+          **メッセージ**:
+          \`\`\`
+          $ERROR_MSG
+          \`\`\`"
+
+          if [ -n "$ERROR_DETAILS" ]; then
+            BODY="$BODY
+
+          **詳細**:
+          \`\`\`
+          $ERROR_DETAILS
+          \`\`\`"
+          fi
+
+          BODY="$BODY
+
+          [実行ログ]($RUN_URL)"
+
+          # 4. 親コメントへの返信制約を尊重 (cmd_156 のロジック流用)
+          if [ "${{ github.event_name }}" = "discussion_comment" ]; then
+            PARENT_ID=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on DiscussionComment { replyTo { id } }
+                }
+              }' \
+              -f id="${{ github.event.comment.node_id }}" 2>/dev/null | \
+              python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('data',{}).get('node',{}).get('replyTo') or {}).get('id',''))" \
+              2>/dev/null || echo "")
+            if [ -n "$PARENT_ID" ]; then
+              REPLY_ARGS="-f replyToId=$PARENT_ID"
+            else
+              REPLY_ARGS="-f replyToId=${{ github.event.comment.node_id }}"
+            fi
+          else
+            REPLY_ARGS=""
+          fi
+          gh api graphql -f query='
+            mutation($id: ID!, $body: String!, $replyToId: ID) {
+              addDiscussionComment(input: {discussionId: $id, body: $body, replyToId: $replyToId}) {
+                comment { id }
+              }
+            }' \
+            -f id="${{ github.event.discussion.node_id }}" \
+            -f body="$BODY" \
+            $REPLY_ARGS 2>/dev/null || true

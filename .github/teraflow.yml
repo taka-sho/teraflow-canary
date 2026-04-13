@@ -1,0 +1,4 @@
+teraflow_version: "v0.5.20"
+skill_mode: "discovery"
+assignments:
+  discovery: "claude"

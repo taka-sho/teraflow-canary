@@ -364,9 +364,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           DISCUSSION_CATEGORY: ${{ github.event.discussion.category.name }}
+          DISCUSSION_TITLE: ${{ github.event.discussion.title }}
         run: |
           COMMENT="$COMMENT_BODY"
           CATEGORY="$DISCUSSION_CATEGORY"
+          TITLE="$DISCUSSION_TITLE"
           LABELS=$(gh api graphql -f query='
             query($id: ID!) {
               node(id: $id) {
@@ -379,7 +381,12 @@ jobs:
             python3 -c "import json,sys; labels=[n.get('name','') for n in json.load(sys.stdin).get('data',{}).get('node',{}).get('labels',{}).get('nodes',[]) if n.get('name')]; print(','.join(labels))" \
             2>/dev/null || echo "")
 
-          if echo "$LABELS" | grep -qiE "(^|,)(discovery|要件探索|grill)(,|$)" || [ "$CATEGORY" = "01-Requirements" ]; then
+          E2E_GENERAL="false"
+          if [ "$CATEGORY" = "General" ] && echo "$TITLE" | grep -q '^\[E2E Test\]'; then
+            E2E_GENERAL="true"
+          fi
+
+          if echo "$LABELS" | grep -qiE "(^|,)(discovery|要件探索|grill)(,|$)" || [ "$CATEGORY" = "01-Requirements" ] || [ "$E2E_GENERAL" = "true" ]; then
             if echo "$COMMENT" | grep -q "要求確定"; then
               echo "mode=discovery-confirm" >> $GITHUB_OUTPUT
             else

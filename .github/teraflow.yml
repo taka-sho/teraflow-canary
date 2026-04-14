@@ -1,5 +1,5 @@
 version: "1"
-teraflow_version: "v0.5.22"
+teraflow_version: "v0.5.23"
 project:
   name: teraflow-canary
   description: ""

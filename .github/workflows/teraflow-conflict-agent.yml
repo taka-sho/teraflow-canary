@@ -98,7 +98,7 @@ jobs:
         run: |
 
           set -e
-          go install "github.com/taka-sho/teraflow@v0.5.22"
+          go install "github.com/taka-sho/teraflow@v0.5.23"
 
       - name: Analyze conflict
         id: conflict

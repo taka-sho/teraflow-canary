@@ -180,7 +180,7 @@ jobs:
             except Exception:
                 print('')
             " 2>/dev/null || echo "")
-            TERAFLOW_INSTALL_REF="${TERAFLOW_REF:-v0.5.22}"
+            TERAFLOW_INSTALL_REF="${TERAFLOW_REF:-v0.5.23}"
             go install "github.com/taka-sho/teraflow@${TERAFLOW_INSTALL_REF}"
             ln -sf "$(go env GOPATH)/bin/teraflow" ./teraflow
           fi

@@ -136,6 +136,26 @@ tree:
       要件確定に進めてください。'
     parsed_answers: []
     unparsed_portion: ''
+- id: dialogue.1776134283738
+  question: 以下について教えてください：
+  category: dialogue
+  status: answered
+  recommendation: ''
+  answer: 要求確定
+  resolved_by: user
+  resolved_at: '2026-04-14T02:38:03.738299+00:00'
+  depends_on: []
+  children: []
+  meta:
+    skill_mode: confirm
+    discussion_title: '[E2E Test] E2E Discovery Test - 20260414_113336'
+    assistant_comment: "## \U0001F50D 要件探索\n\n以下について教えてください：\n\n1. 実装するその他の機能は何ですか？\n\
+      \   a) パスワードリセット  b) プロフィール編集  c) 2段階認証  d) その他\n\n2. 認証エラー時の対応はどうしますか？\n  \
+      \ a) エラーメッセージ表示  b) リダイレクト  c) その他\n\n3. RBACのロールはどのように設定しますか？\n   a) 管理者のみ\
+      \  b) 審査者含む  c) その他\n\n> 記号で回答できます: 「1a 2b 3c」"
+    latest_user_comment: 要求確定
+    parsed_answers: []
+    unparsed_portion: ''
 summary:
   total: 0
   answered: 0
@@ -143,4 +163,4 @@ summary:
   skipped: 0
   blocked: 0
   progress_percent: 0
-updated_at: '2026-04-14T02:37:11.674966+00:00'
+updated_at: '2026-04-14T02:38:03.738304+00:00'

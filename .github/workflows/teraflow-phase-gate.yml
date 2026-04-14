@@ -1,0 +1,96 @@
+# TF-001: Phase Gate - PR consistency check
+# Triggered by: PR opened/synchronize/reopened
+# Action: Run teraflow scan, check phase/stage consistency, comment on PR
+name: teraflow-phase-gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: teraflow-phase-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  phase-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+
+        with:
+
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+
+        env:
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GONOSUMCHECK: github.com/taka-sho/teraflow
+          GONOSUMDB: github.com/taka-sho/teraflow
+
+        run: |
+
+          set -e
+          go install "github.com/taka-sho/teraflow@v0.5.21"
+
+      - name: Run phase gate check
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          # Run teraflow scan to check project state
+          SCAN_OUTPUT=$(teraflow scan --config .github/teraflow.yml --format json 2>&1 || echo '{"status":"error","message":"scan failed"}')
+          echo "Scan output: $SCAN_OUTPUT"
+
+          SCAN_STATUS=$(echo "$SCAN_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "error")
+
+          # Get current state
+          CURRENT_STAGE=$(python3 -c "import yaml; s=yaml.safe_load(open('.github/project-state.yml')) or {}; print(s.get('lifecycle',{}).get('current_stage','unknown'))" 2>/dev/null || echo "unknown")
+
+          CURRENT_PHASE=$(python3 -c "import yaml; s=yaml.safe_load(open('.github/project-state.yml')) or {}; print(s.get('phases',{}).get('current','unknown'))" 2>/dev/null || echo "unknown")
+
+          echo "status=$SCAN_STATUS" >> $GITHUB_OUTPUT
+          echo "stage=$CURRENT_STAGE" >> $GITHUB_OUTPUT
+          echo "phase=$CURRENT_PHASE" >> $GITHUB_OUTPUT
+
+      - name: Post phase gate result
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STATUS="${{ steps.gate.outputs.status }}"
+          STAGE="${{ steps.gate.outputs.stage }}"
+          PHASE="${{ steps.gate.outputs.phase }}"
+
+          if [ "$STATUS" = "ok" ]; then
+            MSG="### ✅ Phase Gate: PASS
+
+            | 項目 | 値 |
+            |------|-----|
+            | 現在のステージ | \`$STAGE\` |
+            | 現在のフェーズ | \`$PHASE\` |
+            | プロジェクト状態 | ✅ 正常 |
+
+            teraflow scan が正常終了しました。"
+          else
+            MSG="### ⚠️ Phase Gate: 注意
+
+            | 項目 | 値 |
+            |------|-----|
+            | 現在のステージ | \`$STAGE\` |
+            | 現在のフェーズ | \`$PHASE\` |
+            | プロジェクト状態 | ⚠️ $STATUS |
+
+            \`teraflow doctor\` を実行して詳細を確認してください。"
+          fi
+
+          gh pr comment ${{ github.event.pull_request.number }} --body "$MSG"

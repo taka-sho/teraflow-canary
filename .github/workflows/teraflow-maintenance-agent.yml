@@ -1,0 +1,166 @@
+# teraflow-maintenance-agent.yml
+# TF-015: Maintenance Agent workflow template
+name: teraflow-maintenance-agent
+on:
+  schedule:
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: teraflow-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintenance-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check required secrets
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "has_key=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set. Skipping AI analysis."
+            echo "has_key=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post API key not set warning
+        if: steps.check.outputs.has_key == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "⚠️ Maintenance AI unavailable: API key not set ($(date -u '+%Y-%m-%d'))" \
+            --body "## ⚠️ AI Agent が応答できませんでした
+
+          API キーが設定されていないため、AI による保守分析を実行できませんでした。
+
+          **対応方法:**
+          1. リポジトリの Settings → Secrets and variables → Actions を開く
+          2. プロバイダーに応じたシークレットを登録（ANTHROPIC_API_KEY / OPENAI_API_KEY）
+          3. 設定後、\`workflow_dispatch\` で再実行すると AI が応答します
+
+          詳細: [AI Provider 設定ガイド](docs/guide/ai-providers.md)" \
+            --label "maintenance" 2>/dev/null || \
+            echo "Issue creation failed (label 'maintenance' may not exist)"
+
+      - uses: actions/setup-go@v5
+
+        with:
+
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+
+        env:
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GONOSUMCHECK: github.com/taka-sho/teraflow
+          GONOSUMDB: github.com/taka-sho/teraflow
+
+        run: |
+
+          set -e
+          go install "github.com/taka-sho/teraflow@v0.5.21"
+
+      - name: Pull latest state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
+
+      - name: Run maintenance check
+        id: maintenance
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # Run doctor for health check
+          HEALTH_JSON=$(teraflow doctor --format json --config .github/teraflow.yml \
+            2>/dev/null || echo '{"status":"error","checks":[]}')
+          HEALTH_STATUS=$(echo "$HEALTH_JSON" | python3 -c \
+            "import json,sys; d=json.load(sys.stdin); print(d.get('status','unknown'))" \
+            2>/dev/null || echo "unknown")
+
+          echo "health_status=$HEALTH_STATUS" >> $GITHUB_OUTPUT
+
+          if [ "$HEALTH_STATUS" = "ok" ] || [ "$HEALTH_STATUS" = "healthy" ]; then
+            echo "✅ Project health is good"
+            echo "needs_issue=false" >> $GITHUB_OUTPUT
+          else
+            # Run AI maintenance agent if ANTHROPIC_API_KEY available
+            if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+              echo "$HEALTH_JSON" > /tmp/maintenance_input.txt
+              teraflow agent assign \
+                --type maintenance \
+                --input-file /tmp/maintenance_input.txt \
+                --format json \
+                --config .github/teraflow.yml \
+                > /tmp/maintenance_result.json 2>/dev/null || \
+                echo '{"output":"保守分析に失敗しました。手動確認が必要です。"}' \
+                > /tmp/maintenance_result.json
+
+              AI_OUTPUT=$(python3 -c "import json; print(json.load(open('/tmp/maintenance_result.json')).get('output',''))" 2>/dev/null || echo "AI分析失敗")
+            else
+              AI_OUTPUT="（ANTHROPIC_API_KEY未設定 — AI分析スキップ）"
+            fi
+
+            DELIM_AI="TERAFLOW_AI_OUTPUT_$(date +%s%N)"
+            echo "ai_output<<${DELIM_AI}" >> "$GITHUB_OUTPUT"
+            echo "$AI_OUTPUT" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "${DELIM_AI}" >> "$GITHUB_OUTPUT"
+            echo "needs_issue=true" >> "$GITHUB_OUTPUT"
+            DELIM_HEALTH="TERAFLOW_HEALTH_JSON_$(date +%s%N)"
+            echo "health_json<<${DELIM_HEALTH}" >> "$GITHUB_OUTPUT"
+            echo "$HEALTH_JSON" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "${DELIM_HEALTH}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create maintenance issue if needed
+        if: steps.maintenance.outputs.needs_issue == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "🔧 週次保守スコアリングアラート: $(date -u '+%Y-%m-%d')" \
+            --body "## 🔧 保守メンテナンスが必要です
+
+          **ヘルスチェック結果**: ⚠️ ${{ steps.maintenance.outputs.health_status }}
+
+          ### ヘルスチェック詳細
+          \`\`\`json
+          ${{ steps.maintenance.outputs.health_json }}
+          \`\`\`
+
+          ### AI 保守提案
+          ${{ steps.maintenance.outputs.ai_output }}
+
+          ---
+          > *teraflow maintenance-agent による週次自動スコアリング（毎日曜 JST 9:00 実行）*" \
+            --label "maintenance" 2>/dev/null || \
+            echo "Issue creation failed (label 'maintenance' may not exist)"
+
+      - name: Commit and push state
+        run: |
+          git add .github/project-state.yml .teraflow/ || true
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: update project state [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            echo "Push attempt $i failed, retrying in 5s..."
+            sleep 5
+          done

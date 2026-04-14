@@ -1,0 +1,65 @@
+# TF-011: Test Generate
+# Triggered by: implementation PR merged
+# Action: Generate test skeletons from verified_by test specifications
+name: teraflow-test-generate
+on:
+  pull_request:
+    types: [closed]
+
+concurrency:
+  group: teraflow-test-generate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  test-generate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    if: github.event.pull_request.merged == true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GONOSUMCHECK: github.com/taka-sho/teraflow
+          GONOSUMDB: github.com/taka-sho/teraflow
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            go build -o ./teraflow .
+            mkdir -p "$(go env GOPATH)/bin"
+            ln -sf "$(pwd)/teraflow" "$(go env GOPATH)/bin/teraflow"
+          else
+            go install "github.com/taka-sho/teraflow@v0.5.21"
+            ln -sf "$(go env GOPATH)/bin/teraflow" ./teraflow
+          fi
+
+      - name: Generate test skeletons from merged implementation
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -e
+          DESIGN_DOCS=$(echo "$PR_BODY" | grep -Eo 'docs/[a-zA-Z0-9_./-]+\.md' | sort -u || true)
+          if [ -z "$DESIGN_DOCS" ]; then
+            echo "No design docs referenced in PR body. Nothing to generate."
+            exit 0
+          fi
+
+          while IFS= read -r design; do
+            [ -z "$design" ] && continue
+            if [ ! -f "$design" ]; then
+              echo "Skip missing design doc: $design"
+              continue
+            fi
+            teraflow implement --design "$design" --parallel 1 --dry-run --config .github/teraflow.yml >/dev/null
+          done <<EOF_DOCS
+          $DESIGN_DOCS
+          EOF_DOCS

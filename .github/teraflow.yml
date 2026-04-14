@@ -1,4 +1,52 @@
-teraflow_version: "v0.5.20"
-skill_mode: "discovery"
+version: "1"
+teraflow_version: "v0.5.21"
+project:
+  name: teraflow-canary
+  description: ""
+  repository: ""
+confirmation:
+  trigger: 確定
+  req_trigger: 要求確定
+ai:
+  default_provider: openai
+agent:
+  provider: ""
+  model: ""
+  max_tokens: 0
+  timeout: 0
+  custom_command: ""
+  fallback: ""
+  trust_level: ""
+  rate_limit:
+    max_calls_per_hour: 0
 assignments:
-  discovery: "claude"
+  ci-fix:
+    provider: openai
+    model: gpt-4o-mini
+  conflict:
+    provider: openai
+    model: gpt-4o-mini
+  implement:
+    provider: openai
+    model: gpt-4o-mini
+  incident:
+    provider: openai
+    model: gpt-4o-mini
+  maintenance:
+    provider: openai
+    model: gpt-4o-mini
+  requirements:
+    provider: openai
+    model: gpt-4o-mini
+  review:
+    provider: openai
+    model: gpt-4o-mini
+hooks:
+  on_discussion_comment:
+    - action: respond
+      skill: requirements
+  on_discussion_created:
+    - action: respond
+      skill: requirements
+harness:
+  score_threshold: 70

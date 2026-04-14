@@ -1,0 +1,202 @@
+# TF-008: CI Fix Agent
+# Triggered by: check_run completed with failure
+# Action: Collect CI logs, suggest fix, post as issue/comment
+name: teraflow-ci-fix-agent
+on:
+  check_run:
+    types: [completed]
+
+concurrency:
+  group: teraflow-ci-fix-${{ github.event.check_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  ci-fix-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    # Only on failure, skip dependabot and bots
+    if: >-
+      github.event.check_run.conclusion == 'failure' &&
+      github.event.check_run.app.slug != 'dependabot'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "has_key=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set. Skipping agent."
+            echo "has_key=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check RBAC permission
+        if: steps.check.outputs.has_key == 'true'
+        id: rbac_check
+        run: |
+          SENDER="${{ github.event.sender.login }}"
+          RESULT=$(teraflow rbac check \
+            --user "$SENDER" \
+            --action "agent.run.ci-fix" \
+            --config .github/teraflow.yml \
+            --format json 2>/dev/null || echo '{"allowed":true}')
+          ALLOWED=$(echo "$RESULT" | python3 -c \
+            "import json,sys; print(json.load(sys.stdin).get('allowed', True))" \
+            2>/dev/null || echo "True")
+          echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
+          echo "sender=$SENDER" >> $GITHUB_OUTPUT
+
+      - name: Post API key not set warning
+        if: steps.check.outputs.has_key == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM=$(gh pr list --head "${{ github.event.check_run.check_suite.head_branch }}" \
+            --json number --jq '.[0].number' 2>/dev/null || echo "")
+          MSG="## ⚠️ AI Agent が応答できませんでした
+
+          API キーが設定されていないため、AI によるCI修正提案を実行できませんでした。
+
+          **対応方法:**
+          1. リポジトリの Settings → Secrets and variables → Actions を開く
+          2. プロバイダーに応じたシークレットを登録（ANTHROPIC_API_KEY / OPENAI_API_KEY）
+          3. 設定後、CIを再実行すると AI が応答します
+
+          詳細: [AI Provider 設定ガイド](docs/guide/ai-providers.md)"
+
+          if [ -n "$PR_NUM" ]; then
+            gh pr comment "$PR_NUM" --body "$MSG"
+          else
+            gh issue create \
+              --title "AI CI Fix unavailable: API key not set" \
+              --body "$MSG" \
+              --label "ci-failure" 2>/dev/null || echo "Issue creation failed"
+          fi
+
+      - name: Post permission denied comment
+        if: steps.rbac_check.outputs.allowed == 'False'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM=$(gh pr list --head "${{ github.event.check_run.check_suite.head_branch }}" \
+            --json number --jq '.[0].number' 2>/dev/null || echo "")
+          MSG="## 🔒 権限不足
+
+          @${{ steps.rbac_check.outputs.sender }} には \`agent.run.ci-fix\` 権限がありません。
+          管理者にロールの付与を依頼してください。
+
+          > *teraflow RBAC による自動チェック*"
+
+          if [ -n "$PR_NUM" ]; then
+            gh pr comment "$PR_NUM" --body "$MSG"
+          else
+            gh issue create \
+              --title "RBAC denied: agent.run.ci-fix" \
+              --body "$MSG" \
+              --label "ci-failure" 2>/dev/null || echo "Issue creation failed"
+          fi
+
+      - uses: actions/setup-go@v5
+
+        with:
+
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+
+        env:
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GONOSUMCHECK: github.com/taka-sho/teraflow
+          GONOSUMDB: github.com/taka-sho/teraflow
+
+        run: |
+
+          set -e
+          go install "github.com/taka-sho/teraflow@v0.5.21"
+
+      - name: Collect CI failure logs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHECK_RUN_ID="${{ github.event.check_run.id }}"
+          RUN_NAME="${{ github.event.check_run.name }}"
+
+          cat > /tmp/ci_input.txt << EOF
+          CI Check Failed: $RUN_NAME
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.event.check_run.check_suite.head_branch }}
+          Commit: ${{ github.event.check_run.head_sha }}
+
+          Failure details:
+          ${{ github.event.check_run.output.summary }}
+          ${{ github.event.check_run.output.text }}
+          EOF
+
+          # Try to get workflow run logs
+          WORKFLOW_RUN_ID=$(gh api "/repos/${{ github.repository }}/check-runs/$CHECK_RUN_ID" \
+            --jq '.check_suite.id' 2>/dev/null || echo "")
+
+          if [ -n "$WORKFLOW_RUN_ID" ]; then
+            gh run view "$WORKFLOW_RUN_ID" --log-failed 2>/dev/null | head -c 4000 >> /tmp/ci_input.txt || true
+          fi
+
+      - name: Run CI fix agent
+        id: fix
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          teraflow agent assign \
+            --type ci-fix \
+            --user "${{ steps.rbac_check.outputs.sender }}" \
+            --input-file /tmp/ci_input.txt \
+            --format json \
+            --config .github/teraflow.yml \
+            > /tmp/fix_result.json 2>/dev/null || \
+            echo '{"output":"CI修正提案の生成に失敗しました。"}' > /tmp/fix_result.json
+
+          OUTPUT=$(python3 -c "import json; print(json.load(open('/tmp/fix_result.json')).get('output',''))" 2>/dev/null || echo "提案生成失敗")
+
+          DELIM="TERAFLOW_OUTPUT_$(date +%s%N)"
+          echo "output<<${DELIM}" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "${DELIM}" >> "$GITHUB_OUTPUT"
+
+      - name: Post fix suggestion
+        if: steps.check.outputs.has_key == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find associated PR if exists
+          PR_NUM=$(gh pr list --head "${{ github.event.check_run.check_suite.head_branch }}" \
+            --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          MSG="## 🔧 AI CI Fix Suggestion
+
+          **CI Check**: ${{ github.event.check_run.name }}
+          **Status**: ❌ Failed
+
+          ${{ steps.fix.outputs.output }}
+
+          > *teraflow ci-fix-agent による自動分析です。提案を確認してから適用してください。*"
+
+          if [ -n "$PR_NUM" ]; then
+            gh pr comment "$PR_NUM" --body "$MSG"
+          else
+            # Create an issue
+            gh issue create \
+              --title "CI Fix Needed: ${{ github.event.check_run.name }}" \
+              --body "$MSG" \
+              --label "ci-failure" 2>/dev/null || echo "Issue creation failed"
+          fi

@@ -1,0 +1,157 @@
+# TF-014: Incident Investigation Agent
+# Triggered by: issues labeled with "incident-*"
+# Action: Analyze incident, post investigation report
+name: teraflow-incident-agent
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: teraflow-incident-${{ github.event.issue.id }}
+  cancel-in-progress: false
+
+jobs:
+  incident-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    if: startsWith(github.event.label.name, 'incident-')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "has_key=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set. Skipping agent."
+            echo "has_key=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check RBAC permission
+        if: steps.check.outputs.has_key == 'true'
+        id: rbac_check
+        run: |
+          SENDER="${{ github.event.sender.login }}"
+          RESULT=$(teraflow rbac check \
+            --user "$SENDER" \
+            --action "agent.run.incident" \
+            --config .github/teraflow.yml \
+            --format json 2>/dev/null || echo '{"allowed":true}')
+          ALLOWED=$(echo "$RESULT" | python3 -c \
+            "import json,sys; print(json.load(sys.stdin).get('allowed', True))" \
+            2>/dev/null || echo "True")
+          echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
+          echo "sender=$SENDER" >> $GITHUB_OUTPUT
+
+      - name: Post API key not set warning
+        if: steps.check.outputs.has_key == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## ⚠️ AI Agent が応答できませんでした
+
+          API キーが設定されていないため、AI によるインシデント調査を実行できませんでした。
+
+          **対応方法:**
+          1. リポジトリの Settings → Secrets and variables → Actions を開く
+          2. プロバイダーに応じたシークレットを登録（ANTHROPIC_API_KEY / OPENAI_API_KEY）
+          3. 設定後、Issue に再度 \`incident-*\` ラベルを付与すると AI が応答します
+
+          詳細: [AI Provider 設定ガイド](docs/guide/ai-providers.md)"
+
+      - name: Post permission denied comment
+        if: steps.rbac_check.outputs.allowed == 'False'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## 🔒 権限不足
+
+          @${{ steps.rbac_check.outputs.sender }} には \`agent.run.incident\` 権限がありません。
+          管理者にロールの付与を依頼してください。
+
+          > *teraflow RBAC による自動チェック*"
+
+      - uses: actions/setup-go@v5
+
+        with:
+
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+
+        env:
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+
+          set -e
+          go install "github.com/taka-sho/teraflow@v0.5.21"
+
+      - name: Investigate incident
+        id: investigate
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          cat > /tmp/incident_input.txt << 'ENDINPUT'
+          Incident: ${{ github.event.issue.title }}
+          Severity label: ${{ github.event.label.name }}
+
+          ${{ github.event.issue.body }}
+          ENDINPUT
+
+          # Add recent rework log if exists
+          if [ -f .teraflow/rework-log.yml ]; then
+            echo "--- Recent Rework Log ---" >> /tmp/incident_input.txt
+            tail -50 .teraflow/rework-log.yml >> /tmp/incident_input.txt
+          fi
+
+          teraflow agent assign \
+            --type incident \
+            --user "${{ steps.rbac_check.outputs.sender }}" \
+            --input-file /tmp/incident_input.txt \
+            --format json \
+            --config .github/teraflow.yml \
+            > /tmp/incident_result.json 2>/dev/null || \
+            echo '{"output":"インシデント調査に失敗しました。"}' > /tmp/incident_result.json
+
+          OUTPUT=$(python3 -c "import json; print(json.load(open('/tmp/incident_result.json')).get('output',''))" 2>/dev/null || echo "調査失敗")
+
+          DELIM="TERAFLOW_OUTPUT_$(date +%s%N)"
+          echo "output<<${DELIM}" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "${DELIM}" >> "$GITHUB_OUTPUT"
+
+      - name: Record incident and post analysis
+        if: steps.check.outputs.has_key == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          # Record in teraflow incident log
+          teraflow incident create \
+            --title "${{ github.event.issue.title }}" \
+            --severity "${LABEL#incident-}" \
+            --config .github/teraflow.yml 2>/dev/null || true
+
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## 🚨 AI Incident Investigation
+
+          ${{ steps.investigate.outputs.output }}
+
+          ---
+          インシデントを記録しました（\`teraflow incident list\` で確認可能）。
+
+          > *teraflow incident-agent による自動調査です。*"

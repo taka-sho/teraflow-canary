@@ -1,0 +1,194 @@
+# TF-007: Implementation Agent
+# Triggered by: issues labeled with "agent-implement" or "phase: implementation"
+# Action: Implement feature from issue requirements, create PR
+name: teraflow-implement-agent
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: teraflow-agent-${{ github.event.issue.id }}
+  cancel-in-progress: false
+
+jobs:
+  implement-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    if: "${{ github.event.label.name == 'agent-implement' || github.event.label.name == 'phase: implementation' }}"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check required secrets
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "has_key=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set. Skipping agent."
+            echo "has_key=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check RBAC permission
+        if: steps.check.outputs.has_key == 'true'
+        id: rbac_check
+        run: |
+          SENDER="${{ github.event.sender.login }}"
+          RESULT=$(teraflow rbac check \
+            --user "$SENDER" \
+            --action "agent.run.implement" \
+            --config .github/teraflow.yml \
+            --format json 2>/dev/null || echo '{"allowed":true}')
+          ALLOWED=$(echo "$RESULT" | python3 -c \
+            "import json,sys; print(json.load(sys.stdin).get('allowed', True))" \
+            2>/dev/null || echo "True")
+          echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
+          echo "sender=$SENDER" >> $GITHUB_OUTPUT
+
+      - name: Post API key not set warning
+        if: steps.check.outputs.has_key == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## ⚠️ AI Agent が応答できませんでした
+
+          API キーが設定されていないため、AI による実装提案を実行できませんでした。
+
+          **対応方法:**
+          1. リポジトリの Settings → Secrets and variables → Actions を開く
+          2. プロバイダーに応じたシークレットを登録（ANTHROPIC_API_KEY / OPENAI_API_KEY）
+          3. 設定後、Issue に再度 \`agent-implement\` ラベルを付与すると AI が応答します
+
+          詳細: [AI Provider 設定ガイド](docs/guide/ai-providers.md)"
+
+      - name: Post permission denied comment
+        if: steps.rbac_check.outputs.allowed == 'False'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## 🔒 権限不足
+
+          @${{ steps.rbac_check.outputs.sender }} には \`agent.run.implement\` 権限がありません。
+          管理者にロールの付与を依頼してください。
+
+          > *teraflow RBAC による自動チェック*"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - uses: actions/setup-go@v5
+
+        with:
+
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+
+        env:
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GONOSUMCHECK: github.com/taka-sho/teraflow
+          GONOSUMDB: github.com/taka-sho/teraflow
+
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            go build -o ./teraflow .
+            mkdir -p "$(go env GOPATH)/bin"
+            ln -sf "$(pwd)/teraflow" "$(go env GOPATH)/bin/teraflow"
+          else
+            go install "github.com/taka-sho/teraflow@v0.5.21"
+            ln -sf "$(go env GOPATH)/bin/teraflow" ./teraflow
+          fi
+
+      - name: Generate implementation
+        id: implement
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          ISSUE_BODY='${{ github.event.issue.body }}'
+          DESIGN_DOC=$(echo "$ISSUE_BODY" | grep -Eo 'docs/[a-zA-Z0-9_./-]+\.md' | head -1 || true)
+          MODULES=$(echo "$ISSUE_BODY" | grep -Eo '(internal|cmd|pkg|tests)/[a-zA-Z0-9_./-]+\.(go|py)' | sort -u || true)
+
+          MODULE_COUNT=0
+          if [ -n "$DESIGN_DOC" ] && [ -n "$MODULES" ]; then
+            MODULE_COUNT=$(echo "$MODULES" | wc -l | tr -d ' ')
+            echo "$MODULES" | xargs -I{} -P 3 sh -c '
+              teraflow implement \
+                --design "'"$DESIGN_DOC"'" \
+                --module "{}" \
+                --parallel 3 \
+                --dry-run \
+                --config .github/teraflow.yml >/dev/null
+            '
+          fi
+
+          # Collect repository context
+          cat > /tmp/impl_input.txt << 'ENDINPUT'
+          Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+
+          Requirements:
+          ${{ github.event.issue.body }}
+
+          Repository structure (top-level):
+          ENDINPUT
+          ls -la >> /tmp/impl_input.txt
+          echo "---" >> /tmp/impl_input.txt
+          echo "Go module: $(head -2 go.mod 2>/dev/null)" >> /tmp/impl_input.txt
+          echo "Detected design doc: ${DESIGN_DOC:-none}" >> /tmp/impl_input.txt
+          echo "Detected modules: ${MODULE_COUNT}" >> /tmp/impl_input.txt
+
+          teraflow agent assign \
+            --type implement \
+            --user "${{ steps.rbac_check.outputs.sender }}" \
+            --input-file /tmp/impl_input.txt \
+            --format json \
+            --config .github/teraflow.yml \
+            > /tmp/impl_result.json 2>/dev/null || \
+            echo '{"output":"実装提案の生成に失敗しました。","success":false}' > /tmp/impl_result.json
+
+          SUCCESS=$(python3 -c "import json; print(json.load(open('/tmp/impl_result.json')).get('success', False))" 2>/dev/null || echo "False")
+
+          OUTPUT=$(python3 -c "import json; print(json.load(open('/tmp/impl_result.json')).get('output',''))" 2>/dev/null || echo "実装生成失敗")
+
+          echo "success=$SUCCESS" >> "$GITHUB_OUTPUT"
+          DELIM="TERAFLOW_OUTPUT_$(date +%s%N)"
+          echo "output<<${DELIM}" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "${DELIM}" >> "$GITHUB_OUTPUT"
+
+      - name: Post implementation proposal as comment
+        if: steps.check.outputs.has_key == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # For "supervised" mode: post as comment for human review
+          # For "autonomous" mode: create branch and PR (not implemented yet)
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## 🤖 AI Implementation Proposal
+
+          ${{ steps.implement.outputs.output }}
+
+          ---
+          **信頼レベル**: supervised（人間のレビューが必要です）
+
+          実装内容を確認し、問題なければ手動でPRを作成してください。
+
+          > *teraflow implement-agent による自動実装提案です。*"

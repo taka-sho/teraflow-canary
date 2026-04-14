@@ -1,0 +1,148 @@
+# TF-010: Conflict Resolution Agent
+# Triggered by: issues labeled with "conflict"
+# Action: Analyze conflicting PR, suggest resolution
+name: teraflow-conflict-agent
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: teraflow-conflict-${{ github.event.issue.id }}
+  cancel-in-progress: false
+
+jobs:
+  conflict-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    if: github.event.label.name == 'conflict'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check required secrets
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "has_key=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set. Skipping agent."
+            echo "has_key=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check RBAC permission
+        if: steps.check.outputs.has_key == 'true'
+        id: rbac_check
+        run: |
+          SENDER="${{ github.event.sender.login }}"
+          RESULT=$(teraflow rbac check \
+            --user "$SENDER" \
+            --action "agent.run.conflict" \
+            --config .github/teraflow.yml \
+            --format json 2>/dev/null || echo '{"allowed":true}')
+          ALLOWED=$(echo "$RESULT" | python3 -c \
+            "import json,sys; print(json.load(sys.stdin).get('allowed', True))" \
+            2>/dev/null || echo "True")
+          echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
+          echo "sender=$SENDER" >> $GITHUB_OUTPUT
+
+      - name: Post API key not set warning
+        if: steps.check.outputs.has_key == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## ⚠️ AI Agent が応答できませんでした
+
+          API キーが設定されていないため、AI によるコンフリクト分析を実行できませんでした。
+
+          **対応方法:**
+          1. リポジトリの Settings → Secrets and variables → Actions を開く
+          2. プロバイダーに応じたシークレットを登録（ANTHROPIC_API_KEY / OPENAI_API_KEY）
+          3. 設定後、Issue に再度 \`conflict\` ラベルを付与すると AI が応答します
+
+          詳細: [AI Provider 設定ガイド](docs/guide/ai-providers.md)"
+
+      - name: Post permission denied comment
+        if: steps.rbac_check.outputs.allowed == 'False'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## 🔒 権限不足
+
+          @${{ steps.rbac_check.outputs.sender }} には \`agent.run.conflict\` 権限がありません。
+          管理者にロールの付与を依頼してください。
+
+          > *teraflow RBAC による自動チェック*"
+
+      - uses: actions/setup-go@v5
+
+        with:
+
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+
+        env:
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+
+          set -e
+          go install "github.com/taka-sho/teraflow@v0.5.21"
+
+      - name: Analyze conflict
+        id: conflict
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # Get PR number from issue body or linked PR
+          PR_NUM=$(echo "${{ github.event.issue.body }}" | grep -oP '(?<=#)\d+' | head -1)
+
+          if [ -n "$PR_NUM" ]; then
+            gh pr diff "$PR_NUM" | head -c 6000 > /tmp/conflict_input.txt 2>/dev/null || true
+          fi
+
+          echo "Issue: ${{ github.event.issue.title }}" >> /tmp/conflict_input.txt
+          echo "Body: ${{ github.event.issue.body }}" >> /tmp/conflict_input.txt
+
+          teraflow agent assign \
+            --type conflict \
+            --user "${{ steps.rbac_check.outputs.sender }}" \
+            --input-file /tmp/conflict_input.txt \
+            --format json \
+            --config .github/teraflow.yml \
+            > /tmp/conflict_result.json 2>/dev/null || \
+            echo '{"output":"コンフリクト分析に失敗しました。"}' > /tmp/conflict_result.json
+
+          OUTPUT=$(python3 -c "import json; print(json.load(open('/tmp/conflict_result.json')).get('output',''))" 2>/dev/null || echo "分析失敗")
+
+          DELIM="TERAFLOW_OUTPUT_$(date +%s%N)"
+          echo "output<<${DELIM}" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "${DELIM}" >> "$GITHUB_OUTPUT"
+
+      - name: Post conflict resolution advice
+        if: steps.check.outputs.has_key == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body \
+            "## 🔀 AI Conflict Resolution
+
+          ${{ steps.conflict.outputs.output }}
+
+          > *teraflow conflict-agent による自動分析です。*"

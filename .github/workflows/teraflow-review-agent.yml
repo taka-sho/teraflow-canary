@@ -1,0 +1,159 @@
+# TF-009: AI Review Agent
+# Triggered by: PR opened/synchronize
+# Action: Collect PR diff, run teraflow agent assign --type review, post comment
+name: teraflow-review-agent
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: teraflow-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check required secrets
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+            echo "has_key=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is set. Skipping agent."
+            echo "has_key=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check RBAC permission
+        if: steps.check.outputs.has_key == 'true'
+        id: rbac_check
+        run: |
+          SENDER="${{ github.event.sender.login }}"
+          RESULT=$(teraflow rbac check \
+            --user "$SENDER" \
+            --action "agent.run.review" \
+            --config .github/teraflow.yml \
+            --format json 2>/dev/null || echo '{"allowed":true}')
+          ALLOWED=$(echo "$RESULT" | python3 -c \
+            "import json,sys; print(json.load(sys.stdin).get('allowed', True))" \
+            2>/dev/null || echo "True")
+          echo "allowed=$ALLOWED" >> $GITHUB_OUTPUT
+          echo "sender=$SENDER" >> $GITHUB_OUTPUT
+
+      - name: Post API key not set warning
+        if: steps.check.outputs.has_key == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body \
+            "## ⚠️ AI Agent が応答できませんでした
+
+          API キーが設定されていないため、AI によるコードレビューを実行できませんでした。
+
+          **対応方法:**
+          1. リポジトリの Settings → Secrets and variables → Actions を開く
+          2. プロバイダーに応じたシークレットを登録（ANTHROPIC_API_KEY / OPENAI_API_KEY）
+          3. 設定後、PRを再度開くか synchronize すると AI が応答します
+
+          詳細: [AI Provider 設定ガイド](docs/guide/ai-providers.md)"
+
+      - name: Post permission denied comment
+        if: steps.rbac_check.outputs.allowed == 'False'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body \
+            "## 🔒 権限不足
+
+          @${{ steps.rbac_check.outputs.sender }} には \`agent.run.review\` 権限がありません。
+          管理者にロールの付与を依頼してください。
+
+          > *teraflow RBAC による自動チェック*"
+
+      - uses: actions/setup-go@v5
+
+        with:
+
+          go-version: stable
+          cache: false
+
+      - name: Install teraflow (pinned to latest GitHub Release)
+
+        env:
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GONOSUMCHECK: github.com/taka-sho/teraflow
+          GONOSUMDB: github.com/taka-sho/teraflow
+
+        run: |
+
+          set -e
+          go install "github.com/taka-sho/teraflow@v0.5.21"
+
+      - name: Collect PR diff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get PR diff (limit to 8000 chars to avoid token limit)
+          gh pr diff ${{ github.event.pull_request.number }} | head -c 8000 > /tmp/pr_diff.txt
+          echo "PR diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
+
+          # Add PR context
+          cat >> /tmp/pr_diff.txt << 'EOF'
+
+          ---
+          PR Title: ${{ github.event.pull_request.title }}
+          PR Author: ${{ github.event.pull_request.user.login }}
+          Changed files: ${{ github.event.pull_request.changed_files }}
+          EOF
+
+      - name: Run AI review agent
+        id: review
+        if: steps.check.outputs.has_key == 'true' && steps.rbac_check.outputs.allowed != 'False'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -e
+          teraflow agent assign \
+            --type review \
+            --user "${{ steps.rbac_check.outputs.sender }}" \
+            --input-file /tmp/pr_diff.txt \
+            --format json \
+            --config .github/teraflow.yml \
+            > /tmp/review_result.json 2>&1 || {
+            echo "Agent failed, using fallback message"
+            echo '{"output":"AIレビューの実行に失敗しました。手動レビューを実施してください。","success":false}' > /tmp/review_result.json
+          }
+
+          OUTPUT=$(python3 -c "import json; print(json.load(open('/tmp/review_result.json')).get('output', 'レビュー結果なし'))" 2>/dev/null || cat /tmp/review_result.json)
+
+          DELIM="TERAFLOW_REVIEW_OUTPUT_$(date +%s%N)"
+          echo "review_output<<${DELIM}" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "${DELIM}" >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment
+        if: steps.check.outputs.has_key == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MSG="## 🤖 AI Code Review
+
+          ${{ steps.review.outputs.review_output }}
+
+          ---
+          > *This review was generated by teraflow AI review agent. Human review is still required.*"
+
+          gh pr comment ${{ github.event.pull_request.number }} --body "$MSG"

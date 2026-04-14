@@ -1,0 +1,35 @@
+name: teraflow-validate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Build teraflow
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            go build -o ./teraflow .
+            mkdir -p "$(go env GOPATH)/bin"
+            ln -sf "$(pwd)/teraflow" "$(go env GOPATH)/bin/teraflow"
+          else
+            go install "github.com/taka-sho/teraflow@v0.5.21"
+            ln -sf "$(go env GOPATH)/bin/teraflow" ./teraflow
+          fi
+      - name: Build index
+        run: ./teraflow index build --config .github/teraflow.yml
+      - name: Validate CoDD consistency
+        run: |
+          set +e
+          ./teraflow validate --full --config .github/teraflow.yml
+          rc=0
+          set -e
+          if [ "" -ne 0 ]; then
+            echo "::warning::validate found CoDD issues (exit=). Reporting only in this workflow."
+          fi

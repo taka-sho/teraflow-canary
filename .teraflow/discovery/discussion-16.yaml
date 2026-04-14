@@ -224,6 +224,23 @@ tree:
       要件確定に進めてください。'
     parsed_answers: []
     unparsed_portion: ''
+- id: dialogue.1776135018173
+  question: 全ての分岐が解決されたため、要件定義は完了です。
+  category: dialogue
+  status: answered
+  recommendation: ''
+  answer: 要求確定
+  resolved_by: user
+  resolved_at: '2026-04-14T02:50:18.173133+00:00'
+  depends_on: []
+  children: []
+  meta:
+    skill_mode: confirm
+    discussion_title: '[E2E Test] E2E Discovery Test - 20260414_114610'
+    assistant_comment: 全ての分岐が解決されたため、要件定義は完了です。
+    latest_user_comment: 要求確定
+    parsed_answers: []
+    unparsed_portion: ''
 summary:
   total: 11
   answered: 11
@@ -231,4 +248,4 @@ summary:
   skipped: 0
   blocked: 0
   progress_percent: 100
-updated_at: '2026-04-14T02:49:25.707235+00:00'
+updated_at: '2026-04-14T02:50:18.173138+00:00'

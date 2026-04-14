@@ -111,6 +111,26 @@ tree:
       要件確定に進めてください。'
     parsed_answers: []
     unparsed_portion: ''
+- id: dialogue.1776136085923
+  question: 以下について教えてください：
+  category: dialogue
+  status: answered
+  recommendation: ''
+  answer: 要求確定
+  resolved_by: user
+  resolved_at: '2026-04-14T03:08:05.923420+00:00'
+  depends_on: []
+  children: []
+  meta:
+    skill_mode: confirm
+    discussion_title: '[E2E Test] E2E Discovery Test - 20260414_120351'
+    assistant_comment: "## \U0001F50D 要件探索\n\n以下について教えてください：\n\n1. ユーザー権限はどのように管理しますか？\n\
+      \   a) RBAC  b) ABAC  c) その他\n\n2. 多要素認証の方法は何ですか？\n   a) SMS  b) メール  c) 認証アプリ\
+      \  d) その他\n\n3. ユーザー認証の詳細設定は必要ですか？\n   a) はい  b) いいえ\n\n> 記号で回答できます: 「1a 2b\
+      \ 3c」"
+    latest_user_comment: 要求確定
+    parsed_answers: []
+    unparsed_portion: ''
 summary:
   total: 0
   answered: 0
@@ -118,4 +138,4 @@ summary:
   skipped: 0
   blocked: 0
   progress_percent: 0
-updated_at: '2026-04-14T03:07:07.472852+00:00'
+updated_at: '2026-04-14T03:08:05.923425+00:00'

@@ -175,11 +175,60 @@ tree:
       補足: OAuthはGoogle優先、JWTは24時間運用を想定します。'
     parsed_answers: []
     unparsed_portion: ''
+- id: user_type
+  question: ''
+  category: ''
+  status: answered
+  children: []
+  answer: ''
+  resolved_by: user
+  resolved_at: '2026-04-14T02:49:25.707113+00:00'
+- id: rbac_target
+  question: ''
+  category: ''
+  status: answered
+  children: []
+  answer: ''
+  resolved_by: user
+  resolved_at: '2026-04-14T02:49:25.707120+00:00'
+- id: login_method
+  question: ''
+  category: ''
+  status: answered
+  children: []
+  answer: ''
+  resolved_by: user
+  resolved_at: '2026-04-14T02:49:25.707126+00:00'
+- id: dialogue.1776134965707
+  question: 全ての要件が確定しました。
+  category: dialogue
+  status: answered
+  recommendation: ''
+  answer: '最終回答です。
+
+    1a 2a 3c
+
+    要件確定に進めてください。'
+  resolved_by: user
+  resolved_at: '2026-04-14T02:49:25.707136+00:00'
+  depends_on: []
+  children: []
+  meta:
+    skill_mode: dialogue
+    discussion_title: '[E2E Test] E2E Discovery Test - 20260414_114610'
+    assistant_comment: 全ての要件が確定しました。
+    latest_user_comment: '最終回答です。
+
+      1a 2a 3c
+
+      要件確定に進めてください。'
+    parsed_answers: []
+    unparsed_portion: ''
 summary:
-  total: 8
-  answered: 8
+  total: 11
+  answered: 11
   pending: 0
   skipped: 0
   blocked: 0
   progress_percent: 100
-updated_at: '2026-04-14T02:48:37.703345+00:00'
+updated_at: '2026-04-14T02:49:25.707235+00:00'

@@ -39,7 +39,7 @@ jobs:
         run: |
 
           set -e
-          go install "github.com/taka-sho/teraflow@v0.5.21"
+          go install "github.com/taka-sho/teraflow@v0.5.22"
 
       - name: Run phase gate check
         id: gate

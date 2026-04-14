@@ -39,7 +39,7 @@ jobs:
           GONOSUMDB: github.com/taka-sho/teraflow
         run: |
           set -e
-          go install "github.com/taka-sho/teraflow@v0.5.21"
+          go install "github.com/taka-sho/teraflow@v0.5.22"
 
       - name: Run tests with coverage
         run: go test ./... -coverprofile=coverage.txt -covermode=atomic

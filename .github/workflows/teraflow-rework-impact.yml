@@ -52,7 +52,7 @@ jobs:
             mkdir -p "$(go env GOPATH)/bin"
             ln -sf "$(pwd)/teraflow" "$(go env GOPATH)/bin/teraflow"
           else
-            go install "github.com/taka-sho/teraflow@v0.5.21"
+            go install "github.com/taka-sho/teraflow@v0.5.22"
             ln -sf "$(go env GOPATH)/bin/teraflow" ./teraflow
           fi
 

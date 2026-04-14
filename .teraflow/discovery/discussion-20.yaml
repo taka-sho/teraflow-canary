@@ -55,6 +55,34 @@ tree:
       4. 第一段階完了後に社内デモを実施し、利用者の移行手順を検証します。'
     parsed_answers: []
     unparsed_portion: ''
+- id: dialogue.1776135978454
+  question: 以下について教えてください：
+  category: dialogue
+  status: answered
+  recommendation: ''
+  answer: '追加回答です。
+
+    1a 2a 3c
+
+    補足: OAuthはGoogle優先、JWTは24時間運用を想定します。'
+  resolved_by: user
+  resolved_at: '2026-04-14T03:06:18.454116+00:00'
+  depends_on: []
+  children: []
+  meta:
+    skill_mode: dialogue
+    discussion_title: '[E2E Test] E2E Discovery Test - 20260414_120351'
+    assistant_comment: "## \U0001F50D 要件探索\n\n以下について教えてください：\n\n1. どのくらいの期間で実装を希望しますか？\n\
+      \   a) 1ヶ月  b) 3ヶ月  c) 6ヶ月  d) 不明\n\n2. 多要素認証が必要ですか？\n   a) はい  b) いいえ  c) 後で決める\n\
+      \n3. ユーザー権限の詳細は必要ですか？\n   a) 管理者  b) 一般ユーザー  c) ゲスト  d) その他\n\n> 記号で回答できます:\
+      \ 「1a 2b 3c」"
+    latest_user_comment: '追加回答です。
+
+      1a 2a 3c
+
+      補足: OAuthはGoogle優先、JWTは24時間運用を想定します。'
+    parsed_answers: []
+    unparsed_portion: ''
 summary:
   total: 0
   answered: 0
@@ -62,4 +90,4 @@ summary:
   skipped: 0
   blocked: 0
   progress_percent: 0
-updated_at: '2026-04-14T03:05:24.398341+00:00'
+updated_at: '2026-04-14T03:06:18.454214+00:00'

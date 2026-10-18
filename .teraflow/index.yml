@@ -1,0 +1,10 @@
+version: "1"
+generated_at: 2026-04-14T02:39:07.281675Z
+entries:
+    - node_id: e2e_discovery_test_20260414_113336
+      title: '[E2E Test] E2E Discovery Test - 20260414_113336'
+      path: docs/システム要件/e2e_discovery_test_20260414_113336.md
+      status: draft
+      updated_at: 2026-04-14T11:39:07.278027373+09:00
+      content_hash: 4c44029eb18b1fcd31193d60c40b6d20128ca6a819b0b0479438f3b85dc6e4e8
+      summary_available: false
